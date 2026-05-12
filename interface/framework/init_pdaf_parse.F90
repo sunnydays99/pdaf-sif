@@ -58,10 +58,12 @@ SUBROUTINE init_pdaf_parse()
 
   use mod_assimilation,&
        only: cradius_GRACE, sradius_GRACE, &
-       cradius_SM, sradius_SM
+       cradius_SM, sradius_SM, &
+       cradius_SIF, sradius_SIF
 #ifdef CLMFIVE
   use obs_GRACE_pdafomi, only: rms_obs_GRACE
   use obs_SM_pdafomi, only: rms_obs_SM
+  use obs_SIF_pdafomi, only: rms_obs_SIF
 #endif
 #if defined CLMSA
 #ifdef CLMFIVE
@@ -106,6 +108,9 @@ SUBROUTINE init_pdaf_parse()
   rms_obs_SM = rms_obs              ! backward compatibility
   handle = 'rms_obs_SM'             ! RMS error for SM observations
   CALL parse(handle, rms_obs_SM)
+  rms_obs_SIF = rms_obs              ! backward compatibility
+  handle = 'rms_obs_SIF'             ! RMS error for SIF observations
+  CALL parse(handle, rms_obs_SIF)
   ! rms_obs_C = rms_obs              ! backward compatibility
   ! handle = 'rms_obs_C'             ! RMS error for C observations
   ! CALL parse(handle, rms_obs_C)
@@ -172,6 +177,12 @@ SUBROUTINE init_pdaf_parse()
   sradius_SM = sradius              ! For backward compatibility
   handle = 'sradius_SM'             ! Set support radius for SM observations
   call parse(handle, sradius_SM)
+  cradius_SIF = cradius              ! For backward compatibility
+  handle = 'cradius_SIF'             ! Set cut-off radius for SIF observations
+  call parse(handle, cradius_SIF)
+  sradius_SIF = sradius              ! For backward compatibility
+  handle = 'sradius_SIF'             ! Set support radius for SIF observations
+  call parse(handle, sradius_SIF)
 
   ! Setting for file output
   handle = 'filename'                ! Set name of output file
