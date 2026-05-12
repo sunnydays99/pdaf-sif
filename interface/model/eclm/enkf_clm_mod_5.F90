@@ -82,11 +82,11 @@ module enkf_clm_mod
   integer :: obs_type_update_texture = 0
 
   !===========================================================================
-  ! CHANGE 1: SIF DA additions — module-level declarations
+  !  SIF DA additions 
   !===========================================================================
   integer(c_int), bind(C, name="clmupdate_sif") :: clmupdate_sif
   !< C-bound switch: 0 = SIF obs-only (no state update)
-  !<                 1 = assimilate SIF and update BOTH leafc AND elai
+  !<                 1 = assimilate SIF and update BOTH leafc AND tlai
   !< Also add to enkfpf.par:  int clmupdate_sif = 0;
   !< REQUIRES clmupdate_tws=1 (needs hactiveg_levels).
 
@@ -95,21 +95,27 @@ module enkf_clm_mod
 
   integer :: clm_varsize_sif = 0
   !< Total entries in the SIF state vector block.
-  !< = 2 * num_hactiveg  (one leafc + one elai per gridcell)
+  !< = 2 * num_hactiveg  (one leafc + one tlai per gridcell)
 
   integer :: clm_sif_offset = 0
   !< Index of the first SIF entry in clm_statevec.
   !< = clm_statevecsize before define_clm_statevec_sif is called.
 
+  ! Per-gridcell increment arrays filled by clm_update_sif and read by
+  ! print_inc_clm. Indexed (begg:endg). Allocated in define_clm_statevec_sif,
+  ! filled (posterior - prior) in clm_update_sif, reset each DA cycle.
+  real(r8), allocatable :: leafc_inc_g(:)  !< gridcell-avg leafc increment [gC/m2]
+  real(r8), allocatable :: tlai_inc_g(:)   !< gridcell-avg tlai increment [m2/m2]
+
   ! Within the SIF block (size = 2*num_hactiveg):
   !   positions 1..num_hactiveg           = gridcell-average leafc [gC/m2]
-  !   positions num_hactiveg+1..2*num_hactiveg = gridcell-average elai [m2/m2]
+  !   positions num_hactiveg+1..2*num_hactiveg = gridcell-average tlai [m2/m2]
   !
   ! Why both?
   !   FSIF = f(APAR, fyield, escape_frac)
-  !   APAR depends directly on elai (immediate radiation interception).
-  !   leafc drives elai via allometry on the NEXT time step (1-step lag).
-  !   Updating both gives immediate effect (elai) + self-consistent carbon
+  !   APAR depends directly on tlai (immediate radiation interception).
+  !   leafc drives tlai via allometry on the NEXT time step (1-step lag).
+  !   Updating both gives immediate effect (tlai) + self-consistent carbon
   !   balance (leafc), matching DART/Huo et al. 2023 approach.
   !===========================================================================
 
@@ -628,18 +634,23 @@ module enkf_clm_mod
   !===========================================================================
   ! new subroutine define_clm_statevec_sif
   !===========================================================================
-  !> Define the SIF state vector block for leafc + elai assimilation
+  !> Define the SIF state vector block for leafc + tlai assimilation
   !>
   !> Appends TWO values per hydrologically active gridcell to clm_statevec:
-  !>   [leafc_1, leafc_2, ..., leafc_N, elai_1, elai_2, ..., elai_N]
+  !>   [leafc_1, leafc_2, ..., leafc_N, tlai_1, tlai_2, ..., tlai_N]
   !>   where N = num_hactiveg.
   !>
   !>   Block layout within clm_statevec:
   !>   clm_sif_offset + 1            ..  clm_sif_offset + num_hactiveg     = leafc
-  !>   clm_sif_offset + num_hactiveg + 1 .. clm_sif_offset + 2*num_hactiveg = elai
+  !>   clm_sif_offset + num_hactiveg + 1 .. clm_sif_offset + 2*num_hactiveg = tlai
   !>
-  !> MUST be called after define_clm_statevec_tws because it reuses
-  !> num_hactiveg and hactiveg_levels.
+  !> Why BOTH leafc and tlai?
+  !>   leafc: maintains carbon balance; allometry re-derives TLAI from it
+  !>          on the next step, so the update is self-consistent long-term.
+  !>   tlai:  gives immediate effect on next SIF computation (APAR depends
+  !>          on ELAI which is derived from TLAI within the same CLM step).
+  !>
+  !> MUST be called after define_clm_statevec_tws (reuses hactiveg_levels).
   !>
   subroutine define_clm_statevec_sif(mype)
 
@@ -656,9 +667,17 @@ module enkf_clm_mod
     ! Record offset BEFORE extending clm_statevecsize
     clm_sif_offset  = clm_statevecsize
 
-    ! Two values per active gridcell: leafc + elai
+    ! Two values per active gridcell: leafc + tlai
     clm_varsize_sif  = 2 * num_hactiveg
     clm_statevecsize = clm_statevecsize + clm_varsize_sif
+
+    ! Allocate gridcell-level increment arrays (begg:endg, zeroed each cycle)
+    IF (allocated(leafc_inc_g)) DEALLOCATE(leafc_inc_g)
+    IF (allocated(tlai_inc_g))  DEALLOCATE(tlai_inc_g)
+    ALLOCATE(leafc_inc_g(clm_begg:clm_endg))
+    ALLOCATE(tlai_inc_g (clm_begg:clm_endg))
+    leafc_inc_g = 0.0_r8
+    tlai_inc_g  = 0.0_r8
 
 #ifdef PDAF_DEBUG
     WRITE(*, '(a,i5,a,i8,a,i8)') &
@@ -682,10 +701,12 @@ module enkf_clm_mod
     IF (allocated(clm_statevec_orig))   deallocate(clm_statevec_orig)
 
     !=========================================================================
-    ! reset SIF metadata on cleanup
+    !  reset SIF metadata on cleanup
     !=========================================================================
     clm_varsize_sif = 0
     clm_sif_offset  = 0
+    IF (allocated(leafc_inc_g)) DEALLOCATE(leafc_inc_g)
+    IF (allocated(tlai_inc_g))  DEALLOCATE(tlai_inc_g)
     !=========================================================================
 
   end subroutine cleanup_clm_statevec
@@ -1069,15 +1090,16 @@ module enkf_clm_mod
   !===========================================================================
   ! new subroutine set_clm_statevec_sif
   !===========================================================================
-  !> Fill the SIF state vector block with gridcell-average leafc AND elai
+  !>  Fill the SIF state vector block with gridcell-average leafc AND tlai
   !>
   !> State vector layout (relative to clm_sif_offset):
-  !>   +1 .. +num_hactiveg            = leafc [gC/m2] per gridcell
-  !>   +num_hactiveg+1..+2*num_hactiveg = elai  [m2/m2] per gridcell
+  !>   +1 .. +num_hactiveg              = leafc [gC/m2] per gridcell
+  !>   +num_hactiveg+1..+2*num_hactiveg = tlai  [m2/m2] per gridcell
   !>
-  !>   FSIF depends directly on APAR = f(elai) → elai update has immediate effect.
-  !>   leafc drives elai via allometry on the NEXT step (self-consistent carbon balance).
-  !>   Updating both matches the DART/Huo et al. 2023 two-variable approach.
+  !> TLAI is used because:
+  !>   TLAI is the prognostic allometric output. ELAI is derived from TLAI
+  !>   within the same CLM step. Updating TLAI persists through allometry;
+  !>   updating ELAI alone is overwritten on the very next time step.
   !>
   subroutine set_clm_statevec_sif()
 
@@ -1089,17 +1111,17 @@ module enkf_clm_mod
     implicit none
 
     integer  :: count, g, p
-    integer  :: cc_leafc, cc_elai
-    real(r8) :: leafc_sum, elai_sum, wt_sum
+    integer  :: cc_leafc, cc_tlai
+    real(r8) :: leafc_sum, tlai_sum, wt_sum
 
     do count = 1, num_hactiveg
 
       g        = hactiveg_levels(count, 1)
       cc_leafc = clm_sif_offset + count
-      cc_elai  = clm_sif_offset + num_hactiveg + count
+      cc_tlai  = clm_sif_offset + num_hactiveg + count
 
       leafc_sum = 0.0_r8
-      elai_sum  = 0.0_r8
+      tlai_sum  = 0.0_r8
       wt_sum    = 0.0_r8
 
       do p = clm_begp, clm_endp
@@ -1111,12 +1133,11 @@ module enkf_clm_mod
                                     * patch%wtgcell(p)
           end if
 
-          ! elai_patch: effective one-sided LAI, updated each step by
-          ! CNVegStructUpdateMod from leafc via SLA allometry.
-          ! This is what directly controls canopy light interception → APAR → SIF.
-          if (canopystate_inst%elai_patch(p) /= spval .and. &
-              canopystate_inst%elai_patch(p) >= 0.0_r8) then
-            elai_sum = elai_sum + canopystate_inst%elai_patch(p) &
+          ! tlai_patch: total LAI.
+          ! CNVegStructUpdateMod sets this from leafc via SLA allometry each step.
+          if (canopystate_inst%tlai_patch(p) /= spval .and. &
+              canopystate_inst%tlai_patch(p) >= 0.0_r8) then
+            tlai_sum = tlai_sum + canopystate_inst%tlai_patch(p) &
                                   * patch%wtgcell(p)
           end if
 
@@ -1127,20 +1148,18 @@ module enkf_clm_mod
 
       if (wt_sum > 0.0_r8) then
         clm_statevec(cc_leafc) = real(leafc_sum / wt_sum)
-        clm_statevec(cc_elai)  = real(elai_sum  / wt_sum)
+        clm_statevec(cc_tlai)  = real(tlai_sum  / wt_sum)
       else
         clm_statevec(cc_leafc) = 0.0
-        clm_statevec(cc_elai)  = 0.0
+        clm_statevec(cc_tlai)  = 0.0
       end if
 
       clm_statevec_orig(cc_leafc) = clm_statevec(cc_leafc)
-      clm_statevec_orig(cc_elai)  = clm_statevec(cc_elai)
+      clm_statevec_orig(cc_tlai)  = clm_statevec(cc_tlai)
 
-      ! Fill gridcell_state for SIF slots so obs operators (e.g. GRACE
-      ! localize_covar_GRACE which reads gridcell_state(i)) don't see
-      ! uninitialised values for the SIF index range.
+      ! Fill gridcell_state so GRACE localize_covar doesn't see uninitialised entries
       gridcell_state(cc_leafc) = g
-      gridcell_state(cc_elai)  = g
+      gridcell_state(cc_tlai)  = g
 
     end do
 
@@ -1727,15 +1746,20 @@ module enkf_clm_mod
   !===========================================================================
   ! new subroutine clm_update_sif
   !===========================================================================
-  !> Distribute SIF analysis increments to CLM leafc_patch AND elai_patch
+  !> Distribute SIF analysis increments to CLM leafc_patch AND tlai_patch
   !>
-  !> After PDAF updates clm_statevec, this routine:
-  !>   1. Applies ratio-increment to leafc_patch for each vegetated patch
-  !>      (self-consistent carbon; allometry updates elai on next CLM step)
-  !>   2. Directly updates elai_patch for immediate effect on next SIF computation
+  !> After PDAF updates clm_statevec, this routine applies ratio-increments to:
+  !>   1. leafc_patch  — carbon balance; CNVegStructUpdateMod re-derives TLAI
+  !>                     from it via SLA allometry at the end of the next step
+  !>   2. tlai_patch   — immediate effect: allometry derives elai from tlai
+  !>                     within the SAME CLM step, so the SIF forward operator
+  !>                     sees the updated radiation interception immediately
   !>
-  !> Both use the same ratio-increment approach as TWS update_soil_layer.
-  !> Physical bounds enforced: leafc in [0, 500 gC/m²], elai in [0, 20 m²/m²].
+  !> We do NOT directly update elai_patch. ELAI is derived from TLAI inside
+  !> CLM (SurfaceAlbedoMod / CanopyFluxesMod). Updating ELAI directly would
+  !> be overwritten the moment allometry runs. Updating TLAI is persistent.
+  !>
+  !> Physical bounds: leafc in [0, 500 gC/m²], tlai in [0, 20 m²/m²].
   !>
   subroutine clm_update_sif()
 
@@ -1745,26 +1769,26 @@ module enkf_clm_mod
 
     implicit none
 
-    real(r8), parameter :: leafc_max = 500.0_r8   ! gC/m2, safe upper cap for BGC
-    real(r8), parameter :: elai_max  =  20.0_r8   ! m2/m2, beyond any real vegetation
+    real(r8), parameter :: leafc_max = 500.0_r8  ! gC/m2 upper cap
+    real(r8), parameter :: tlai_max  =  20.0_r8  ! m2/m2 upper cap
 
     integer  :: count, g, p
-    integer  :: cc_leafc, cc_elai
+    integer  :: cc_leafc, cc_tlai
     real(r8) :: old_leafc, new_leafc, scale_leafc
-    real(r8) :: old_elai,  new_elai,  scale_elai
+    real(r8) :: old_tlai,  new_tlai,  scale_tlai
 
     do count = 1, num_hactiveg
 
       g        = hactiveg_levels(count, 1)
       cc_leafc = clm_sif_offset + count
-      cc_elai  = clm_sif_offset + num_hactiveg + count
+      cc_tlai  = clm_sif_offset + num_hactiveg + count
 
       old_leafc = clm_statevec_orig(cc_leafc)
       new_leafc = clm_statevec(cc_leafc)
-      old_elai  = clm_statevec_orig(cc_elai)
-      new_elai  = clm_statevec(cc_elai)
+      old_tlai  = clm_statevec_orig(cc_tlai)
+      new_tlai  = clm_statevec(cc_tlai)
 
-      ! Compute ratio scale factors with max_inc cap
+      ! Ratio scale factors with max_inc cap (same as TWS update_soil_layer)
       if (abs(new_leafc - old_leafc) > 1.0e-10_r8 .and. old_leafc > 1.0e-8_r8) then
         scale_leafc = new_leafc / old_leafc
         if (abs(scale_leafc - 1.0_r8) > real(max_inc, r8)) &
@@ -1773,19 +1797,20 @@ module enkf_clm_mod
         scale_leafc = 1.0_r8
       end if
 
-      if (abs(new_elai - old_elai) > 1.0e-10_r8 .and. old_elai > 1.0e-8_r8) then
-        scale_elai = new_elai / old_elai
-        if (abs(scale_elai - 1.0_r8) > real(max_inc, r8)) &
-          scale_elai = 1.0_r8 + sign(real(max_inc, r8), scale_elai - 1.0_r8)
+      if (abs(new_tlai - old_tlai) > 1.0e-10_r8 .and. old_tlai > 1.0e-8_r8) then
+        scale_tlai = new_tlai / old_tlai
+        if (abs(scale_tlai - 1.0_r8) > real(max_inc, r8)) &
+          scale_tlai = 1.0_r8 + sign(real(max_inc, r8), scale_tlai - 1.0_r8)
       else
-        scale_elai = 1.0_r8
+        scale_tlai = 1.0_r8
       end if
 
       ! Apply to all vegetated patches in this gridcell
       do p = clm_begp, clm_endp
         if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
 
-          ! 1. Update leafc (carbon balance; drives allometry next step)
+          ! 1. Update leafc — self-consistent carbon; allometry re-derives
+          !    TLAI from leafc at the end of the next CLM time step.
           if (scale_leafc /= 1.0_r8) then
             cnveg_carbonstate_inst%leafc_patch(p) = &
                 cnveg_carbonstate_inst%leafc_patch(p) * scale_leafc
@@ -1793,26 +1818,23 @@ module enkf_clm_mod
                 max(0.0_r8, min(leafc_max, cnveg_carbonstate_inst%leafc_patch(p)))
           end if
 
-          ! 2. Update elai directly (immediate effect on radiation → APAR → SIF)
-          ! NOTE: CNVegStructUpdateMod will recompute elai from leafc at end
-          ! of next CLM time step. The direct elai update is therefore only
-          ! active for ONE assimilation window, after which allometry takes over.
-          ! This is the correct behaviour — same as DART/Huo et al. approach.
-          if (scale_elai /= 1.0_r8) then
-            canopystate_inst%elai_patch(p) = &
-                canopystate_inst%elai_patch(p) * scale_elai
-            canopystate_inst%elai_patch(p) = &
-                max(0.0_r8, min(elai_max, canopystate_inst%elai_patch(p)))
-            ! Also update tlai (total LAI = elai + stem area index contribution)
-            ! to keep them consistent. SAI is not updated — keep existing.
+          ! 2. Update tlai — this is the primary allometric output.
+          !    Allometry in the same CLM step then derives elai from the new tlai,
+          !    so the SIF forward operator immediately sees updated radiation.
+          !    Do NOT touch elai_patch directly, it is derived from tlai.
+          if (scale_tlai /= 1.0_r8) then
             canopystate_inst%tlai_patch(p) = &
-                canopystate_inst%tlai_patch(p) * scale_elai
+                canopystate_inst%tlai_patch(p) * scale_tlai
             canopystate_inst%tlai_patch(p) = &
-                max(0.0_r8, min(elai_max, canopystate_inst%tlai_patch(p)))
+                max(0.0_r8, min(tlai_max, canopystate_inst%tlai_patch(p)))
           end if
 
         end if
       end do
+
+      ! Record gridcell-level increments for print_inc_clm diagnostics
+      leafc_inc_g(g) = new_leafc - old_leafc
+      tlai_inc_g(g)  = new_tlai  - old_tlai   ! stored in tlai_inc_g but represents TLAI inc
 
     end do
 
@@ -2235,9 +2257,9 @@ module enkf_clm_mod
     endif
 
     !=========================================================================
-    ! extend dim_l for SIF state variables (leafc + elai)
+    ! extend dim_l for SIF state variables (leafc + tlai)
     !
-    ! SIF adds TWO values per local domain (gridcell): leafc and elai.
+    ! SIF adds TWO values per local domain (gridcell): leafc and tlai.
     ! They are appended at positions dim_l+1 and dim_l+2 of the extended
     ! local state vector, AFTER all TWS/SWC slots.
     !
@@ -2251,7 +2273,7 @@ module enkf_clm_mod
     ! See the g2l_state_clm and l2g_state_clm routines below.
     !=========================================================================
     if (clmupdate_sif==1) then
-      dim_l = dim_l + 2   ! +1 for leafc, +1 for elai
+      dim_l = dim_l + 2   ! +1 for leafc, +1 for tlai
     end if
     !=========================================================================
 
@@ -2272,8 +2294,8 @@ module enkf_clm_mod
 
     INTEGER :: i, sub, g, j
     !=========================================================================
-    ! declare j_sif, g_sif, tws_dim_l for SIF extraction
-    ! tws_dim_l is the effective dim_l seen by the TWS code, it excludes
+    !  declare j_sif, g_sif, tws_dim_l for SIF extraction
+    ! tws_dim_l is the effective dim_l seen by the TWS code — it excludes
     ! the 2 SIF slots appended at the end when clmupdate_sif=1.
     !=========================================================================
     INTEGER :: j_sif, g_sif, tws_dim_l
@@ -2357,7 +2379,7 @@ module enkf_clm_mod
     end if NOGRACE
 
     !=========================================================================
-    ! extract SIF leafc (dim_l-1) and elai (dim_l) from state_p
+    !  extract SIF leafc (dim_l-1) and tlai (dim_l) from state_p
     ! These slots are appended AFTER all TWS/SWC slots (indices tws_dim_l+1
     ! and tws_dim_l+2 = dim_l-1 and dim_l respectively).
     !=========================================================================
@@ -2369,7 +2391,7 @@ module enkf_clm_mod
       end if
       do j_sif = 1, num_hactiveg
         if (hactiveg_levels(j_sif, 1) == g_sif) then
-          ! dim_l-1 = leafc slot, dim_l = elai slot
+          ! dim_l-1 = leafc slot, dim_l = tlai slot
           state_l(dim_l-1) = state_p(clm_sif_offset + j_sif)
           state_l(dim_l)   = state_p(clm_sif_offset + num_hactiveg + j_sif)
           exit
@@ -2398,7 +2420,7 @@ module enkf_clm_mod
     ! declare j_sif, g_sif, tws_dim_l for SIF write-back.
     !
     ! tws_dim_l = dim_l - 2 when SIF is active: strips the two SIF slots
-    ! (leafc at dim_l-1, elai at dim_l) so the TWS indexing is unchanged.
+    ! (leafc at dim_l-1, tlai at dim_l) so the TWS indexing is unchanged.
     ! The SWC NOGRACE path also uses tws_dim_l so it does not overwrite
     ! the SIF slots.
     !=========================================================================
@@ -2492,9 +2514,9 @@ module enkf_clm_mod
     endif NOGRACE
 
     !=========================================================================
-    !  write back BOTH SIF slots
-    !   state_l(dim_l-1) = leafc  → state_p(clm_sif_offset + j_sif)
-    !   state_l(dim_l)   = elai   → state_p(clm_sif_offset + num_hactiveg + j_sif)
+    ! write back BOTH SIF slots
+    !   state_l(dim_l-1) = leafc → state_p(clm_sif_offset + j_sif)
+    !   state_l(dim_l)   = tlai  → state_p(clm_sif_offset + num_hactiveg + j_sif)
     !
     ! dim_l-1 and dim_l are always the two SIF slots regardless of TWS
     ! state_setup, because init_dim_l_clm appends them last.
@@ -2508,7 +2530,7 @@ module enkf_clm_mod
       do j_sif = 1, num_hactiveg
         if (hactiveg_levels(j_sif, 1) == g_sif) then
           state_p(clm_sif_offset + j_sif)                = state_l(dim_l-1)  ! leafc
-          state_p(clm_sif_offset + num_hactiveg + j_sif) = state_l(dim_l)    ! elai
+          state_p(clm_sif_offset + num_hactiveg + j_sif) = state_l(dim_l)    ! tlai
           exit
         end if
       end do
