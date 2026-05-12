@@ -28,8 +28,7 @@ MODULE obs_SIF_pdafomi
     !
     ! Indexed as (1 : endg-begg+1), i.e. local gridcell offset.
     ! -----------------------------------------------------------------------
-    REAL, ALLOCATABLE, SAVE :: fsif_current(:)    !< gridcell-avg FSIF [W/m2/um]
-    REAL, ALLOCATABLE, SAVE :: coszen_current(:)  !< gridcell COSZEN [-]
+    REAL, ALLOCATABLE, SAVE :: sifescn_current(:) !< gridcell-avg Nadir Escaping SIF [W/m2/um]
     REAL, ALLOCATABLE, SAVE :: fsno_current(:)    !< gridcell snow fraction [-]
 
     ! Declare instances of observation data types used here
@@ -182,22 +181,17 @@ CONTAINS
 
       ! -----------------------------------------------------------------------
       ! Allocate module-level QC arrays and fill them from the live CLM instance.
-      ! These replace the scalar coszen_g/fsno_g/elai_g 
-      !
       ! read_fsif_from_history fills fsif_current, coszen_current, fsno_current
       ! as module-level SAVE arrays indexed (1:endg-begg+1).
       ! It is defined at the bottom of this module.
       ! -----------------------------------------------------------------------
-      IF (ALLOCATED(fsif_current))   DEALLOCATE(fsif_current)
-      IF (ALLOCATED(coszen_current)) DEALLOCATE(coszen_current)
+      IF (ALLOCATED(sifescn_current))   DEALLOCATE(sifescn_current)
       IF (ALLOCATED(fsno_current))   DEALLOCATE(fsno_current)
-      ALLOCATE(fsif_current  (endg-begg+1))
-      ALLOCATE(coszen_current(endg-begg+1))
+      ALLOCATE(sifescn_current (endg-begg+1))
       ALLOCATE(fsno_current  (endg-begg+1))
 
-      CALL read_fsif_from_history(begg, endg, begp, endp, begc, endc)
-      ! After this call: fsif_current(g-begg+1), coszen_current(g-begg+1),
-      ! fsno_current(g-begg+1) are populated for all local gridcells.
+      CALL collect_sif_data(begg, endg, begp, endp, begc, endc)
+      ! After this call: fsif_current(g-begg+1) + fsno_current(g-begg+1) are populated for all local gridcells.
 
       ! -----------------------------------------------------------------------
       ! First pass: count PE-local valid observations (dim_obs_p)
@@ -225,19 +219,24 @@ CONTAINS
                   ! -----------------------------------------------------------
                   ! QC masks — applied before counting this observation
                   ! -----------------------------------------------------------
-                  ! 1. Nighttime: no sunlight → no SIF possible
-                  IF (coszen_current(g-begg+1) < 0.01) CYCLE
-                  ! 2. Snow-dominated gridcell: satellite SIF unreliable
+                  ! 1. Snow-dominated gridcell: satellite SIF unreliable
+                  !  mask out high-albedo/snow contamination
                   IF (fsno_current(g-begg+1) > 0.5) CYCLE
-                  ! 3. Model FSIF invalid (lake=0, urban=0, or spval from patch avg)
-                  IF (fsif_current(g-begg+1) <= 0.0 .OR. &
-                      fsif_current(g-begg+1) == spval) CYCLE
-                  ! 4. Satellite observation negative: physically impossible
+
+                  ! 2. Model SIF invalid (Nighttime / No Veg / Lake)
+                  ! sifescn_current <= 0 handles:
+                  ! - Nighttime (APAR=0)
+                  ! - Bare soil/Urban/Lake
+                  ! - Non-growing season
+                  IF (sifescn_current(g-begg+1) <= 0.0 .OR. &
+                      sifescn_current(g-begg+1) == spval) CYCLE
+
+                  ! 3. Satellite observation negative: physically impossible
                   IF (obs_g(i) <= 0.0) CYCLE
 
+                  ! -----------------------------------------------------------
+
                   dim_obs_p = dim_obs_p + 1
-                  ! id_obs_p set to 1 as a flag (not used directly in obs_op_SIF
-                  ! since we read from fsif_current, not state_p; pattern from SM)
                   thisobs%id_obs_p(1, g-begg+1) = 1
 
                   IF (obs_snapped) THEN
@@ -368,10 +367,9 @@ CONTAINS
               deltay = ABS(lat(g) - lat_obs(i))
 
               IF ((deltax <= dr_obs(1)) .AND. (deltay <= dr_obs(2))) THEN
-                  IF (coszen_current(g-begg+1) < 0.01)   CYCLE
                   IF (fsno_current  (g-begg+1) > 0.5)    CYCLE
-                  IF (fsif_current  (g-begg+1) <= 0.0 .OR. &
-                      fsif_current  (g-begg+1) == spval) CYCLE
+                  IF (sifescn_current  (g-begg+1) <= 0.0 .OR. &
+                      sifescn_current  (g-begg+1) == spval) CYCLE
                   IF (obs_g(i) <= 0.0)                   CYCLE
 
                   ! Haversine: coordinates must be in radians
