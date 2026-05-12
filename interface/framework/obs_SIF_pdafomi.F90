@@ -376,7 +376,7 @@ CONTAINS
                   ocoord_p(1, cnt) = lon_obs(i) * pi / 180.0
                   ocoord_p(2, cnt) = lat_obs(i) * pi / 180.0
 
-                  ! Store gridcell offset for obs_op_SIF lookup of fsif_current
+                  ! Store gridcell offset for obs_op_SIF lookup of sifescn_current
                   obs_index_p(cnt) = g - begg + 1
 
                   obs_p(cnt) = obs_g(i)
@@ -409,7 +409,7 @@ CONTAINS
     !! SIF observation operator
     !!
     !! Maps the model state to SIF observation space by reading from the
-    !! module-level fsif_current array (set in init_dim_obs_SIF).
+    !! module-level sifescn_current array (set in init_dim_obs_SIF).
     !!
     !! This is a direct lookup: obs_index_p(i) holds the gridcell offset
     !! (g-begg+1) set during init_dim_obs_SIF. No state_p indexing is needed
@@ -418,7 +418,7 @@ CONTAINS
     !!
     SUBROUTINE obs_op_SIF(dim_p, dim_obs, state_p, ostate)
 
-      ! fsif_current is a module-level SAVE array in this module,
+      ! sifescn_current is a module-level SAVE array in this module,
       USE mod_assimilation,  ONLY: obs_index_p
       USE PDAFomi_obs_f,     ONLY: PDAFomi_gather_obsstate
 
@@ -439,7 +439,7 @@ CONTAINS
 
       ! Direct lookup into the module-level FSIF array
       DO i = 1, thisobs%dim_obs_p
-          ostate_p(i) = fsif_current(obs_index_p(i))
+          ostate_p(i) = sifescn_current(obs_index_p(i))
       END DO
 
       CALL PDAFomi_gather_obsstate(thisobs, ostate_p, ostate)
@@ -769,8 +769,7 @@ CONTAINS
       IF (ALLOCATED(obs_l_all)) DEALLOCATE(obs_l_all)
 
       ! Deallocate module-level SIF diagnostic arrays (FIX 8)
-      IF (ALLOCATED(fsif_current))   DEALLOCATE(fsif_current)
-      IF (ALLOCATED(coszen_current)) DEALLOCATE(coszen_current)
+      IF (ALLOCATED(sifescn_current))   DEALLOCATE(sifescn_current)
       IF (ALLOCATED(fsno_current))   DEALLOCATE(fsno_current)
 
       firstobs = 0
@@ -779,21 +778,21 @@ CONTAINS
 
 
     !===========================================================================
-    ! read FSIF, COSZEN, FSNO from the live CLM instance
+    ! read sifescn and FSNO from the live CLM instance
     !===========================================================================
 
-    !> @brief Fill module-level fsif_current, coszen_current, fsno_current
+    !>  Fill module-level sifescn_current + fsno_current
     !!
     !! FSIF is a patch-level variable (ptr_patch in hist_addfld1d).
     !! We compute a patch-area-weighted average over all vegetated patches
     !! within each local gridcell. This matches what a nadir-viewing satellite
     !! observes: the area-weighted top-of-canopy SIF from the gridcell footprint.
     !!
-    !! COSZEN and FSNO are already at gridcell / column level and are averaged
+    !! FSNO is already at gridcell / column level and are averaged
     !! over hydrologically active columns.
     !!
-    !! All three arrays are indexed as (1 : endg-begg+1) = local offset.
-    !! Must be called AFTER ALLOCATE of fsif_current etc. in init_dim_obs_SIF.
+    !! All arrays are indexed as (1 : endg-begg+1) = local offset.
+    !! Must be called AFTER ALLOCATE of sifescn_current etc. in init_dim_obs_SIF.
     !!
     SUBROUTINE read_fsif_from_history(begg, endg, begp, endp, begc, endc)
 
@@ -804,7 +803,6 @@ CONTAINS
       USE clm_instMod,   ONLY: photosyns_inst, waterstate_inst, solarabs_inst
       ! photosyns_inst%fsif_patch        — FSIF [W/m2/um] at 740 nm
       ! waterstate_inst%frac_sno_col     — column snow cover fraction
-      ! solarabs_inst%coszen_patch or grc%coszen — cosine solar zenith
 
       ! If grc%coszen is not available in your eCLM version, use:
       ! USE clm_instMod, ONLY: atm2lnd_inst
@@ -816,7 +814,7 @@ CONTAINS
       INTEGER, INTENT(in) :: begg, endg, begp, endp, begc, endc
 
       INTEGER  :: g, p, c
-      REAL(r8) :: wt_sum, fsif_sum, fsno_sum, coszen_val
+      REAL(r8) :: wt_sum, fsif_sum, fsno_sum
       INTEGER  :: n_col_active
 
       DO g = begg, endg
@@ -829,24 +827,21 @@ CONTAINS
               IF (patch%gridcell(p) == g) THEN
                   ! patch%wtgcell: fractional weight of this patch in the gridcell
                   IF (patch%wtgcell(p) > 0.0_r8 .AND. &
-                      photosyns_inst%fsif_patch(p) /= spval .AND. &
-                      photosyns_inst%fsif_patch(p) > 0.0_r8) THEN
-                      fsif_sum = fsif_sum + photosyns_inst%fsif_patch(p) * patch%wtgcell(p)
+                      photosyns_inst%sifescn_patch(p)/= spval .AND. &
+                      photosyns_inst%sifescn_patch(p) > 0.0_r8) THEN
+                      fsif_sum = fsif_sum + photosyns_inst%sifescn_patch(p) * patch%wtgcell(p)
                       wt_sum   = wt_sum   + patch%wtgcell(p)
                   END IF
               END IF
           END DO
 
           IF (wt_sum > 0.0_r8) THEN
-              fsif_current(g-begg+1) = REAL(fsif_sum / wt_sum)
+              sifescn_current(g-begg+1) = REAL(fsif_sum / wt_sum)
           ELSE
               ! Lake, urban, or bare soil gridcell — no SIF possible
-              fsif_current(g-begg+1) = 0.0
+              sifescn_current(g-begg+1) = 0.0
           END IF
 
-          ! --- COSZEN: gridcell cosine solar zenith angle ---
-          ! grc%coszen is populated by CLM at each time step
-          coszen_current(g-begg+1) = REAL(grc%coszen(g))
 
           ! --- FSNO: column-average snow fraction ---
           ! Average over all hydrologically active columns in this gridcell
