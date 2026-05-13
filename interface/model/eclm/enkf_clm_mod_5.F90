@@ -1762,82 +1762,60 @@ module enkf_clm_mod
   !> Physical bounds: leafc in [0, 500 gC/m²], tlai in [0, 20 m²/m²].
   !>
   subroutine clm_update_sif()
-
-    use clm_instMod,  only : cnveg_carbonstate_inst, canopystate_inst
-    use PatchType,    only : patch
+    use clm_instMod, only : bgc_vegetation_inst, canopystate_inst
+    use PatchType,   only : patch
     use shr_kind_mod, only : r8 => shr_kind_r8
-
     implicit none
-
-    real(r8), parameter :: leafc_max = 500.0_r8  ! gC/m2 upper cap
-    real(r8), parameter :: tlai_max  =  20.0_r8  ! m2/m2 upper cap
-
+    real(r8), parameter :: leafc_max = 500.0_r8
+    real(r8), parameter :: tlai_max  =  20.0_r8
     integer  :: count, g, p
     integer  :: cc_leafc, cc_tlai
     real(r8) :: old_leafc, new_leafc, scale_leafc
     real(r8) :: old_tlai,  new_tlai,  scale_tlai
 
     do count = 1, num_hactiveg
-
       g        = hactiveg_levels(count, 1)
       cc_leafc = clm_sif_offset + count
       cc_tlai  = clm_sif_offset + num_hactiveg + count
-
       old_leafc = clm_statevec_orig(cc_leafc)
       new_leafc = clm_statevec(cc_leafc)
       old_tlai  = clm_statevec_orig(cc_tlai)
       new_tlai  = clm_statevec(cc_tlai)
 
-      ! Ratio scale factors with max_inc cap (same as TWS update_soil_layer)
       if (abs(new_leafc - old_leafc) > 1.0e-10_r8 .and. old_leafc > 1.0e-8_r8) then
         scale_leafc = new_leafc / old_leafc
-        if (abs(scale_leafc - 1.0_r8) > real(max_inc, r8)) &
-          scale_leafc = 1.0_r8 + sign(real(max_inc, r8), scale_leafc - 1.0_r8)
+        if (abs(scale_leafc - 1.0_r8) > max_inc) &
+          scale_leafc = 1.0_r8 + sign(max_inc, scale_leafc - 1.0_r8)
       else
         scale_leafc = 1.0_r8
       end if
 
       if (abs(new_tlai - old_tlai) > 1.0e-10_r8 .and. old_tlai > 1.0e-8_r8) then
         scale_tlai = new_tlai / old_tlai
-        if (abs(scale_tlai - 1.0_r8) > real(max_inc, r8)) &
-          scale_tlai = 1.0_r8 + sign(real(max_inc, r8), scale_tlai - 1.0_r8)
+        if (abs(scale_tlai - 1.0_r8) > max_inc) &
+          scale_tlai = 1.0_r8 + sign(max_inc, scale_tlai - 1.0_r8)
       else
         scale_tlai = 1.0_r8
       end if
 
-      ! Apply to all vegetated patches in this gridcell
       do p = clm_begp, clm_endp
         if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
-
-          ! 1. Update leafc — self-consistent carbon; allometry re-derives
-          !    TLAI from leafc at the end of the next CLM time step.
           if (scale_leafc /= 1.0_r8) then
-            cnveg_carbonstate_inst%leafc_patch(p) = &
-                cnveg_carbonstate_inst%leafc_patch(p) * scale_leafc
-            cnveg_carbonstate_inst%leafc_patch(p) = &
-                max(0.0_r8, min(leafc_max, cnveg_carbonstate_inst%leafc_patch(p)))
+            bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) = &
+                max(0.0_r8, min(leafc_max, &
+                    bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) * scale_leafc))
           end if
-
-          ! 2. Update tlai — this is the primary allometric output.
-          !    Allometry in the same CLM step then derives elai from the new tlai,
-          !    so the SIF forward operator immediately sees updated radiation.
-          !    Do NOT touch elai_patch directly, it is derived from tlai.
           if (scale_tlai /= 1.0_r8) then
             canopystate_inst%tlai_patch(p) = &
-                canopystate_inst%tlai_patch(p) * scale_tlai
-            canopystate_inst%tlai_patch(p) = &
-                max(0.0_r8, min(tlai_max, canopystate_inst%tlai_patch(p)))
+                max(0.0_r8, min(tlai_max, &
+                  canopystate_inst%tlai_patch(p) * scale_tlai))
           end if
-
         end if
       end do
 
-      ! Record gridcell-level increments for print_inc_clm diagnostics
       leafc_inc_g(g) = new_leafc - old_leafc
-      tlai_inc_g(g)  = new_tlai  - old_tlai   ! stored in tlai_inc_g but represents TLAI inc
-
+      tlai_inc_g(g)  = new_tlai  - old_tlai
     end do
-
   end subroutine clm_update_sif
   !===========================================================================
 
