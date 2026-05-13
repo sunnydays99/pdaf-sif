@@ -72,7 +72,8 @@ SUBROUTINE next_observation_pdaf(stepnow, nsteps, doexit, time)
   use clm_time_manager, only: get_nstep
   use clm_varcon, only: set_averaging_to_zero
   use clm_varcon, only: ispval
-  use enkf_clm_mod, only: clmupdate_tws
+  use enkf_clm_mod, only: clmupdate_tws, clmupdate_sif
+  use obs_SIF_pdafomi, only: assim_SIF
 #endif
   IMPLICIT NONE
 
@@ -228,7 +229,9 @@ SUBROUTINE next_observation_pdaf(stepnow, nsteps, doexit, time)
 #ifdef CLMSA
 #ifdef CLMFIVE
   OMI:if (use_omi)  then
-    if (clmupdate_tws/=0) then ! only update set_zero when GRACE is assimilated at the current time step
+    ! set_averaging_to_zero is only relevant for GRACE (TWS running mean).
+    ! SIF has no running average in CLM, skip this block for SIF steps.
+    if (clmupdate_tws/=0) then ! only update set_zero when GRACE is assimilated
       nstep = get_nstep()
       if (stepnow/=toffset) then
         write(fn, '(a, i5.5)') trim(obs_filename)//'.', stepnow
@@ -264,6 +267,11 @@ SUBROUTINE next_observation_pdaf(stepnow, nsteps, doexit, time)
         if (mype_world==0 .and. screen > 2) then
           write(*,*)'next_type (in next_observation_pdaf):',trim(obs_type_str)
         end if
+        ! Log SIF-DA status for the upcoming step
+        if (mype_world==0 .and. screen > 2) then
+          write(*,*)'next_observation_pdaf: clmupdate_sif=', clmupdate_sif, &
+              ' assim_SIF=', assim_SIF
+        end if
     end if
 
   end if OMI
@@ -271,5 +279,3 @@ SUBROUTINE next_observation_pdaf(stepnow, nsteps, doexit, time)
 #endif
 
 END SUBROUTINE next_observation_pdaf
-
-
