@@ -955,7 +955,8 @@ contains
     !> @details
     !>     Updates the observation type for the next assimilation cycle when using the OMI interface
     subroutine update_obs_type(obs_type_str)
-        use enkf_clm_mod, only: clmupdate_tws, clmupdate_swc, clmupdate_T, clmupdate_texture
+        use enkf_clm_mod, only: clmupdate_tws, clmupdate_swc, clmupdate_T, &
+                                 clmupdate_texture, clmupdate_sif
         use mod_parallel_pdaf, only: abort_parallel
         implicit none
 
@@ -967,18 +968,31 @@ contains
             clmupdate_swc     = 0
             clmupdate_T       = 0
             clmupdate_texture = 0
+            clmupdate_sif     = 0
 
         case ('SM')
             clmupdate_tws     = 0
             clmupdate_swc     = 1
             clmupdate_T       = 0
             clmupdate_texture = 0
+            clmupdate_sif     = 0
+
+        case ('SIF')
+            ! SIF assimilation: update leafc + tlai via enkf_clm_mod.
+            ! clmupdate_sif=1 enables the state update; set to 0 for obs-only mode.
+            ! clmupdate_tws must be 0 so GRACE TWS averaging is not triggered.
+            clmupdate_tws     = 0
+            clmupdate_swc     = 0
+            clmupdate_T       = 0
+            clmupdate_texture = 0
+            clmupdate_sif     = 1
 
         ! case ('C')
         !     clmupdate_tws     = 0
         !     clmupdate_swc     = 0
         !     clmupdate_T       = 0
         !     clmupdate_texture = 0
+        !     clmupdate_sif     = 0
         !     clmupdate_C       = 1
 
         case default
