@@ -91,6 +91,7 @@ GLOBAL int clmupdate_swc;
 GLOBAL int clmupdate_T;
 GLOBAL int clmupdate_texture;
 GLOBAL int clmupdate_tws;
+GLOBAL int clmupdate_sif; 
 GLOBAL int clmprint_swc;
 GLOBAL int clmprint_et;
 GLOBAL int clmprint_inc;
