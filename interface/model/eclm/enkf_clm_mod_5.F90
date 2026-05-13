@@ -1103,7 +1103,7 @@ module enkf_clm_mod
   !>
   subroutine set_clm_statevec_sif()
 
-    use clm_instMod,  only : cnveg_carbonstate_inst, canopystate_inst
+    use clm_instMod,  only : bgc_vegetation_inst, canopystate_inst
     use PatchType,    only : patch
     use shr_kind_mod, only : r8 => shr_kind_r8
     use clm_varcon,   only : spval
@@ -1127,9 +1127,9 @@ module enkf_clm_mod
       do p = clm_begp, clm_endp
         if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
 
-          if (cnveg_carbonstate_inst%leafc_patch(p) /= spval .and. &
-              cnveg_carbonstate_inst%leafc_patch(p) >= 0.0_r8) then
-            leafc_sum = leafc_sum + cnveg_carbonstate_inst%leafc_patch(p) &
+          if (bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) /= spval .and. &
+              bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p)) >= 0.0_r8) then
+            leafc_sum = leafc_sum + bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) &
                                     * patch%wtgcell(p)
           end if
 
