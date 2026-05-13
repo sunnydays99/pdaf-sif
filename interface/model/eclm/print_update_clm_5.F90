@@ -36,7 +36,7 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
     use spmdmod      , only : masterproc
     use clm_time_manager        , only : get_nstep
     use clm_instMod, only : soilstate_inst, waterstate_inst, &
-                             cnveg_carbonstate_inst, canopystate_inst
+                         bgc_vegetation_inst, canopystate_inst
     use netcdf, only : nf90_create, NF90_CLOBBER, nf90_def_dim, nf90_def_var, &
                        NF90_DOUBLE, NF90_FLOAT, nf90_enddef, nf90_open, NF90_WRITE, &
                        nf90_inq_varid, nf90_put_var, nf90_close
@@ -213,9 +213,9 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
             wt_sum    = 0.0_r8
             do p = clm_begp, clm_endp
                 if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
-                    if (cnveg_carbonstate_inst%leafc_patch(p) /= spval) then
-                        leafc_sum = leafc_sum + cnveg_carbonstate_inst%leafc_patch(p) &
-                                                * patch%wtgcell(p)
+                    if (bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) /= spval) then
+                        leafc_sum = leafc_sum + bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) &
+                        * patch%wtgcell(p)
                         wt_sum    = wt_sum   + patch%wtgcell(p)
                     end if
                 end if
