@@ -1128,7 +1128,7 @@ module enkf_clm_mod
         if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
 
           if (bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) /= spval .and. &
-              bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p)) >= 0.0_r8) then
+              bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) >= 0.0_r8) then
             leafc_sum = leafc_sum + bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) &
                                     * patch%wtgcell(p)
           end if
