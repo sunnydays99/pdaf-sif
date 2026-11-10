@@ -31,20 +31,21 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
     use domainMod    , only : ldomain
     use clm_varpar   , only : nlevsoi
     use clm_varcon   , only : nameg, spval
-    use decompmod    , only : get_proc_global, get_proc_bounds, ldecomp
+    use decompmod    , only : get_proc_global, get_proc_bounds, ldecomp, get_proc_total
     use spmdgathscatmod , only : gather_data_to_master
-    use spmdmod      , only : masterproc
+    use spmdmod      , only : masterproc, npes, mpicom, iam
+    use mpi, only : mpi_gatherv, mpi_real8
     use clm_time_manager        , only : get_nstep
     use clm_instMod, only : soilstate_inst, waterstate_inst, &
-                         bgc_vegetation_inst, canopystate_inst
+                         bgc_vegetation_inst
     use netcdf, only : nf90_create, NF90_CLOBBER, nf90_def_dim, nf90_def_var, &
                        NF90_DOUBLE, NF90_FLOAT, nf90_enddef, nf90_open, NF90_WRITE, &
                        nf90_inq_varid, nf90_put_var, nf90_close
     use enkf_clm_mod, only : clmupdate_swc, clmupdate_texture, clmprint_swc, &
-                              clmupdate_sif, &           ! SIF addition
-                              clm_begp, clm_endp, &      ! SIF: patch bounds
-                              num_hactiveg, hactiveg_levels  ! SIF: active gridcells
-    use PatchType,    only : patch                        ! SIF: patch%gridcell, patch%wtgcell
+                              clmupdate_sif, &              ! SIF addition
+                              clm_begp, clm_endp, &         ! SIF: patch bounds
+                              sif_idx_of_g                  ! SIF: gridcells in the SIF block
+    use PatchType,    only : patch                          ! SIF: patch%gridcell, patch%wtgcell
 
     implicit none
 
@@ -70,9 +71,12 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
     integer :: nerror
     integer :: ndlon, ndlat
 
-    ! SIF: local variables for patch→gridcell averaging
-    integer  :: count, g, p
-    real(r8) :: leafc_sum, tlai_sum, wt_sum
+    ! SIF: local variables for patch -> gridcell averaging and gathering
+    integer  :: g, p, ier, pid, numsend
+    integer  :: ncells, nlunits, ncols, npfts, ncohorts
+    integer  :: numrecvv(0:npes-1), displsv(0:npes-1)
+    real(r8), allocatable :: lc_g(:), ln_g(:), wt_g(:)
+    real(r8), allocatable :: sif_global(:)
 
 
     call get_proc_global(ng=numg, nl=numl, nc=numc, np=nump)
@@ -83,8 +87,9 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
 
     if (masterproc) then
         allocate(clmstate_out(ndlon, ndlat, nlevsoi), stat=nerror)
-        if (clmupdate_sif==1) then
+        if (clmupdate_sif/=0) then
             allocate(clmstate_out_2d(ndlon, ndlat), stat=nerror)
+            allocate(sif_global(1:numg), stat=nerror)
         end if
     end if
 
@@ -114,14 +119,12 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
             end if
 
             ! ==================================================================
-            ! SIF: define LEAFC and TLAI as 2-D time-series (lon, lat, t)
-            ! Units match clm_update_sif bounds: leafc [gC/m2], tlai [m2/m2]
+            ! SIF: posterior LEAFC [gC/m2] and LEAFN [gN/m2] as (x, y, t)
             ! ==================================================================
-            if (clmupdate_sif==1) then
-                ! Reuse dimids(1:2) + dimids(4) for (x, y, t) 3-D variables
+            if (clmupdate_sif/=0) then
                 status = nf90_def_var(il_file_id, "LEAFC", NF90_FLOAT, &
                                       [dimids(1), dimids(2), dimids(4)], ncvarid(5))
-                status = nf90_def_var(il_file_id, "TLAI",  NF90_FLOAT, &
+                status = nf90_def_var(il_file_id, "LEAFN", NF90_FLOAT, &
                                       [dimids(1), dimids(2), dimids(4)], ncvarid(6))
             end if
 
@@ -196,81 +199,56 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
     end if
 
     ! ==================================================================
-    ! SIF: write updated LEAFC and TLAI (posterior gridcell averages)
+    ! SIF: write updated LEAFC and LEAFN (posterior gridcell averages)
     !
-    ! We compute the patch%wtgcell-weighted average over vegetated patches
-    ! in each PE-local gridcell, then scatter to masterproc for output.
-    ! Same averaging as set_clm_statevec_sif and read_fsif_from_history.
+    ! Every PE averages its own patches to its gridcells (begg:endg), weighted
+    ! with patch%wtgcell, in one pass; the gridcell fields are then gathered on
+    ! masterproc with mpi_gatherv (as in print_inc_clm). Gridcells outside the
+    ! SIF block are written as spval.
     ! ==================================================================
-    if (clmupdate_sif==1) then
+    if (clmupdate_sif/=0) then
 
-        ! --- LEAFC ---
-        if (masterproc) clmstate_out_2d(:,:) = real(spval, r8)
+        ! --- gather layout (same as in print_inc_clm)
+        call get_proc_total(iam, ncells, nlunits, ncols, npfts, ncohorts)
+        numsend = ncells
+        do pid = 0, npes-1
+            call get_proc_total(pid, ncells, nlunits, ncols, npfts, ncohorts)
+            numrecvv(pid) = ncells
+        end do
+        displsv(0) = 0
+        do pid = 1, npes-1
+            displsv(pid) = displsv(pid-1) + numrecvv(pid-1)
+        end do
 
-        do count = 1, num_hactiveg
-            g       = hactiveg_levels(count, 1)
-            leafc_sum = 0.0_r8
-            wt_sum    = 0.0_r8
-            do p = clm_begp, clm_endp
-                if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
-                    if (bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) /= spval) then
-                        leafc_sum = leafc_sum + bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) &
-                        * patch%wtgcell(p)
-                        wt_sum    = wt_sum   + patch%wtgcell(p)
-                    end if
-                end if
-            end do
-            if (masterproc) then
-                ji = mod(ldecomp%gdc2glo(g-begg+1)-1, ldomain%ni) + 1
-                jj = (ldecomp%gdc2glo(g-begg+1) - 1)/ldomain%ni + 1
-                if (wt_sum > 0.0_r8) then
-                    clmstate_out_2d(ji,jj) = real(leafc_sum / wt_sum)
-                else
-                    clmstate_out_2d(ji,jj) = 0.0
-                end if
+        ! --- PE-local gridcell averages (one pass over the patches)
+        allocate(lc_g(begg:endg), ln_g(begg:endg), wt_g(begg:endg))
+        lc_g = 0.0_r8; ln_g = 0.0_r8; wt_g = 0.0_r8
+        do p = clm_begp, clm_endp
+            g = patch%gridcell(p)
+            if (sif_idx_of_g(g) == 0) cycle
+            if (.not. patch%active(p) .or. patch%wtgcell(p) <= 0.0_r8) cycle
+            if (bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) /= spval) &
+                lc_g(g) = lc_g(g) + bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch(p) * patch%wtgcell(p)
+            if (bgc_vegetation_inst%cnveg_nitrogenstate_inst%leafn_patch(p) /= spval) &
+                ln_g(g) = ln_g(g) + bgc_vegetation_inst%cnveg_nitrogenstate_inst%leafn_patch(p) * patch%wtgcell(p)
+            wt_g(g) = wt_g(g) + patch%wtgcell(p)
+        end do
+        do g = begg, endg
+            if (wt_g(g) > 0.0_r8) then
+                lc_g(g) = lc_g(g) / wt_g(g)
+                ln_g(g) = ln_g(g) / wt_g(g)
+            else
+                lc_g(g) = spval
+                ln_g(g) = spval
             end if
         end do
 
-        if (masterproc) then
-            status = nf90_inq_varid(il_file_id, "LEAFC", ncvarid(5))
-            status = nf90_put_var(il_file_id, ncvarid(5), clmstate_out_2d(:,:), &
-                                  start=[1,1,ts], count=[ndlon,ndlat,1])
-        end if
+        call write_sif_field(lc_g, "LEAFC", 5)
+        call write_sif_field(ln_g, "LEAFN", 6)
 
-        ! --- TLAI ---
-        if (masterproc) clmstate_out_2d(:,:) = real(spval, r8)
+        deallocate(lc_g, ln_g, wt_g)
 
-        do count = 1, num_hactiveg
-            g      = hactiveg_levels(count, 1)
-            tlai_sum = 0.0_r8
-            wt_sum   = 0.0_r8
-            do p = clm_begp, clm_endp
-                if (patch%gridcell(p) == g .and. patch%wtgcell(p) > 0.0_r8) then
-                    if (canopystate_inst%tlai_patch(p) /= spval) then
-                        tlai_sum = tlai_sum + canopystate_inst%tlai_patch(p) &
-                                              * patch%wtgcell(p)
-                        wt_sum   = wt_sum   + patch%wtgcell(p)
-                    end if
-                end if
-            end do
-            if (masterproc) then
-                ji = mod(ldecomp%gdc2glo(g-begg+1)-1, ldomain%ni) + 1
-                jj = (ldecomp%gdc2glo(g-begg+1) - 1)/ldomain%ni + 1
-                if (wt_sum > 0.0_r8) then
-                    clmstate_out_2d(ji,jj) = real(tlai_sum / wt_sum)
-                else
-                    clmstate_out_2d(ji,jj) = 0.0
-                end if
-            end if
-        end do
-
-        if (masterproc) then
-            status = nf90_inq_varid(il_file_id, "TLAI", ncvarid(6))
-            status = nf90_put_var(il_file_id, ncvarid(6), clmstate_out_2d(:,:), &
-                                  start=[1,1,ts], count=[ndlon,ndlat,1])
-        end if
-
-    end if   ! clmupdate_sif==1
+    end if   ! clmupdate_sif/=0
 
     ! ------------------------------------------------------------------
     ! Close and deallocate
@@ -278,9 +256,36 @@ subroutine print_update_clm(ts,ttot) bind(C,name="print_update_clm")
     if (masterproc) then
         status = nf90_close(il_file_id)
         deallocate(clmstate_out)
-        if (clmupdate_sif==1 .and. allocated(clmstate_out_2d)) &
-            deallocate(clmstate_out_2d)
+        if (allocated(clmstate_out_2d)) deallocate(clmstate_out_2d)
+        if (allocated(sif_global))      deallocate(sif_global)
     end if
+
+contains
+
+    !> gather a PE-local gridcell field (begg:endg) on masterproc and write it at time ts
+    subroutine write_sif_field(field_local, varname, ivar)
+        real(r8),         intent(in) :: field_local(begg:endg)
+        character(len=*), intent(in) :: varname
+        integer,          intent(in) :: ivar
+        if (masterproc) then
+            call mpi_gatherv(field_local(begg), numsend, MPI_REAL8, &
+                             sif_global, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
+        else
+            call mpi_gatherv(field_local(begg), numsend, MPI_REAL8, &
+                             0._r8, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
+        end if
+        if (masterproc) then
+            clmstate_out_2d(:,:) = spval
+            do g1 = 1, numg
+                ji = mod(ldecomp%gdc2glo(g1)-1, ldomain%ni) + 1
+                jj = (ldecomp%gdc2glo(g1) - 1)/ldomain%ni + 1
+                clmstate_out_2d(ji,jj) = sif_global(g1)
+            end do
+            status = nf90_inq_varid(il_file_id, varname, ncvarid(ivar))
+            status = nf90_put_var(il_file_id, ncvarid(ivar), clmstate_out_2d(:,:), &
+                                  start=[1,1,ts], count=[ndlon,ndlat,1])
+        end if
+    end subroutine write_sif_field
 
 end subroutine print_update_clm
 
@@ -289,8 +294,8 @@ end subroutine print_update_clm
 subroutine print_inc_clm() bind(C,name="print_inc_clm")
 !==============================================================================
 ! Writes DA increments (posterior - prior) to <caseid>.inc.<inst>.<date>.nc.
-! SIF addition: writes LEAFC_INC and TLAI_INC using the gridcell-level
-! increment arrays filled by clm_update_sif in enkf_clm_mod.
+! SIF addition: writes LEAFC_INC [gC/m2] and LEAFN_INC [gN/m2], the realised
+! gridcell-average increments filled by clm_update_sif in enkf_clm_mod.
 !==============================================================================
 
   use shr_kind_mod , only : r8 => shr_kind_r8
@@ -309,9 +314,7 @@ subroutine print_inc_clm() bind(C,name="print_inc_clm")
   use mpi, only: mpi_gatherv, mpi_real8
   ! SIF additions
   use enkf_clm_mod, only : clmupdate_sif, &
-                            clm_begg, clm_endg, &
-                            num_hactiveg, hactiveg_levels, &
-                            leafc_inc_g, tlai_inc_g   ! filled by clm_update_sif
+                            leafc_inc_g, leafn_inc_g   ! filled by clm_update_sif (begg:endg)
 
   implicit none
 
@@ -365,7 +368,7 @@ subroutine print_inc_clm() bind(C,name="print_inc_clm")
       allocate(clmstate_tmp_global(1:numg), stat=nerror)
       allocate(clmstate_out(ndlon, ndlat, nlevsoi), stat=nerror)
       clmstate_out(:,:,:) = nan
-      if (clmupdate_sif==1) then
+      if (clmupdate_sif/=0) then
           allocate(clmstate_out_2d(ndlon, ndlat), stat=nerror)
           clmstate_out_2d(:,:) = 0.0_r8
       end if
@@ -401,12 +404,11 @@ subroutine print_inc_clm() bind(C,name="print_inc_clm")
       status = nf90_def_var(il_file_id, "TWS",     NF90_FLOAT, dimids_1level, ncvarid(4))
 
       ! ================================================================
-      ! SIF: define LEAFC_INC and TLAI_INC as 2-D fields (lon, lat)
-      ! Units: LEAFC_INC in gC/m2, TLAI_INC in m2/m2
+      ! SIF: LEAFC_INC [gC/m2] and LEAFN_INC [gN/m2] as 2-D fields (lon, lat)
       ! ================================================================
-      if (clmupdate_sif==1) then
+      if (clmupdate_sif/=0) then
           status = nf90_def_var(il_file_id, "LEAFC_INC", NF90_FLOAT, dimids_1level, ncvarid(5))
-          status = nf90_def_var(il_file_id, "TLAI_INC",  NF90_FLOAT, dimids_1level, ncvarid(6))
+          status = nf90_def_var(il_file_id, "LEAFN_INC", NF90_FLOAT, dimids_1level, ncvarid(6))
       end if
 
       status = nf90_enddef(il_file_id)
@@ -558,81 +560,27 @@ subroutine print_inc_clm() bind(C,name="print_inc_clm")
   end if
 
   ! ==================================================================
-  ! SIF: write LEAFC_INC and TLAI_INC
+  ! SIF: write LEAFC_INC and LEAFN_INC
   !
-  ! leafc_inc_g(g) and tlai_inc_g(g) are filled in clm_update_sif
-  ! (enkf_clm_mod) as (new_gridcell_mean - old_gridcell_mean).
-  ! They are indexed by CLM global gridcell index g (begg:endg).
-  ! We use mpi_gatherv to collect them on masterproc, then write 2-D.
-  !
-  ! For gridcells NOT in num_hactiveg (lake, urban, bare), the arrays
-  ! are initialised to 0 in define_clm_statevec_sif — correct (no update).
+  ! leafc_inc_g / leafn_inc_g (begg:endg) are reset and filled every DA
+  ! cycle in clm_update_sif with the realised gridcell-average increment
+  ! (after limiting and clamping); gridcells outside the SIF block are 0.
   ! ==================================================================
-  if (clmupdate_sif==1) then
+  if (clmupdate_sif/=0) then
 
       allocate(sif_inc_local(begg:endg), stat=nerror)
       if (masterproc) allocate(sif_inc_global(1:numg), stat=nerror)
 
-      ! --- LEAFC_INC ---
-      sif_inc_local(begg:endg) = 0.0_r8
-      do count = 1, num_hactiveg
-          g = hactiveg_levels(count, 1)
-          if (g >= begg .and. g <= endg) &
-              sif_inc_local(g) = real(leafc_inc_g(g), r8)
-      end do
+      sif_inc_local(begg:endg) = leafc_inc_g(begg:endg)
+      call gather_and_write_inc("LEAFC_INC", 5)
 
-      if (masterproc) then
-          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
-                           sif_inc_global, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
-      else
-          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
-                           0._r8, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
-      end if
-
-      if (masterproc) then
-          clmstate_out_2d(:,:) = 0.0_r8
-          do g1 = 1, numg
-              ji = mod(ldecomp%gdc2glo(g1)-1, ldomain%ni) + 1
-              jj = (ldecomp%gdc2glo(g1) - 1)/ldomain%ni + 1
-              clmstate_out_2d(ji,jj) = real(sif_inc_global(g1))
-          end do
-          status = nf90_inq_varid(il_file_id, "LEAFC_INC", ncvarid(5))
-          status = nf90_put_var(il_file_id, ncvarid(5), clmstate_out_2d(:,:), &
-                                start=[1,1], count=[ndlon,ndlat])
-      end if
-
-      ! --- TLAI_INC ---
-      sif_inc_local(begg:endg) = 0.0_r8
-      do count = 1, num_hactiveg
-          g = hactiveg_levels(count, 1)
-          if (g >= begg .and. g <= endg) &
-              sif_inc_local(g) = real(tlai_inc_g(g), r8)
-      end do
-
-      if (masterproc) then
-          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
-                           sif_inc_global, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
-      else
-          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
-                           0._r8, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
-      end if
-
-      if (masterproc) then
-          clmstate_out_2d(:,:) = 0.0_r8
-          do g1 = 1, numg
-              ji = mod(ldecomp%gdc2glo(g1)-1, ldomain%ni) + 1
-              jj = (ldecomp%gdc2glo(g1) - 1)/ldomain%ni + 1
-              clmstate_out_2d(ji,jj) = real(sif_inc_global(g1))
-          end do
-          status = nf90_inq_varid(il_file_id, "TLAI_INC", ncvarid(6))
-          status = nf90_put_var(il_file_id, ncvarid(6), clmstate_out_2d(:,:), &
-                                start=[1,1], count=[ndlon,ndlat])
-      end if
+      sif_inc_local(begg:endg) = leafn_inc_g(begg:endg)
+      call gather_and_write_inc("LEAFN_INC", 6)
 
       deallocate(sif_inc_local)
       if (masterproc) deallocate(sif_inc_global)
 
-  end if   ! clmupdate_sif==1
+  end if   ! clmupdate_sif/=0
 
   ! ------------------------------------------------------------------
   ! Close and deallocate
@@ -641,11 +589,36 @@ subroutine print_inc_clm() bind(C,name="print_inc_clm")
       status = nf90_close(il_file_id)
       deallocate(clmstate_out)
       deallocate(clmstate_tmp_global)
-      if (clmupdate_sif==1 .and. allocated(clmstate_out_2d)) &
-          deallocate(clmstate_out_2d)
+      if (allocated(clmstate_out_2d)) deallocate(clmstate_out_2d)
   end if
   deallocate(tws_inc)
   deallocate(clmstate_tmp_local)
+
+contains
+
+  !> gather sif_inc_local on masterproc and write it as a 2-D field
+  subroutine gather_and_write_inc(varname, ivar)
+      character(len=*), intent(in) :: varname
+      integer,          intent(in) :: ivar
+      if (masterproc) then
+          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
+                           sif_inc_global, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
+      else
+          call mpi_gatherv(sif_inc_local(beg), numsend, MPI_REAL8, &
+                           0._r8, numrecvv, displsv, MPI_REAL8, 0, mpicom, ier)
+      end if
+      if (masterproc) then
+          clmstate_out_2d(:,:) = 0.0_r8
+          do g1 = 1, numg
+              ji = mod(ldecomp%gdc2glo(g1)-1, ldomain%ni) + 1
+              jj = (ldecomp%gdc2glo(g1) - 1)/ldomain%ni + 1
+              clmstate_out_2d(ji,jj) = sif_inc_global(g1)
+          end do
+          status = nf90_inq_varid(il_file_id, varname, ncvarid(ivar))
+          status = nf90_put_var(il_file_id, ncvarid(ivar), clmstate_out_2d(:,:), &
+                                start=[1,1], count=[ndlon,ndlat])
+      end if
+  end subroutine gather_and_write_inc
 
 end subroutine print_inc_clm
 #endif
