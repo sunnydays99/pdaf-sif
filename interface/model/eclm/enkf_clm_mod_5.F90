@@ -92,39 +92,53 @@ module enkf_clm_mod
   !<                     leafc change (keeps the leaf C:N ratio of every patch)
   !< tlai is NOT updated: in CLM5-BGC it is diagnosed from leafc (SLA) every
   !< time step (CNVegStructUpdateMod), so a tlai update would be overwritten
+  !< after one step and is inconsistent with leafc until then.
+  !< Also add to enkfpf.par:  int clmupdate_sif = 0;
   !< Works alone (SIF-only DA) or together with clmupdate_tws=1 / clmupdate_swc=1.
- 
+
   integer :: obs_type_update_sif = 0
   !< Runtime copy of clmupdate_sif, set at the start of each DA cycle.
- 
+
   integer :: clm_varsize_sif = 0
-  !< Total entries in the SIF state vector block = n_sif_vars * num_sif_g
- 
+  !< Total entries in the SIF state vector block = (n_sif_vars + 1) * num_sif_g
+  !< (n_sif_vars updated variables + 1 observation equivalent)
+
   integer :: n_sif_vars = 0
   !< SIF state variables per gridcell: 2 (clmupdate_sif=1), 1 (clmupdate_sif=2)
- 
+
   integer :: num_sif_g = 0
   !< Number of gridcells in the SIF block.
   !<   with clmupdate_tws=1: the TWS gridcells (hactiveg_levels(:,1)), same order
   !<   without TWS:          all gridcells with at least one active vegetated patch
   integer, allocatable :: sif_gridcells(:)   !< (1:num_sif_g) gridcell index g
   integer, allocatable :: sif_idx_of_g(:)    !< (begg:endg) position in sif_gridcells, 0 = not in SIF block
- 
+
   integer :: clm_sif_offset = 0
   !< Index of the first SIF entry in clm_statevec.
   !< = clm_statevecsize before define_clm_statevec_sif is called.
- 
+
   ! Per-gridcell increment arrays filled by clm_update_sif and read by
   ! print_inc_clm. Indexed (begg:endg). Allocated in define_clm_statevec_sif,
   ! filled (posterior - prior) in clm_update_sif, reset each DA cycle.
   real(r8), allocatable :: leafc_inc_g(:)  !< gridcell-avg leafc increment [gC/m2]
   real(r8), allocatable :: leafn_inc_g(:)  !< gridcell-avg leafn increment [gN/m2]
- 
+
   ! Limits for the SIF update (separate from max_inc of the TWS update):
   real(r8) :: max_inc_sif = 0.5_r8    !< max. relative change per DA cycle (0.5 = +-50 %)
   real(r8), parameter :: leafc_max_sif = 538.31_r8  !< upper bound leafc [gC/m2] (as in Huo, 2026)
   real(r8), parameter :: leafn_max_sif =  22.0_r8   !< upper bound leafn [gN/m2] (as in Huo, 2026)
- 
+
+  ! SIF observation equivalent in the state vector (like SIFESCN in DART, 'NO_COPY_BACK'):
+  ! one value per SIF gridcell = instantaneous gridcell-mean SIFESCN of the last model
+  ! time step before the analysis (choose the DA time close to the satellite overpass),
+  ! appended after leafc/leafn. Each ensemble member contributes its own SIF, so the
+  ! observation operator sees the ensemble spread. Not part of the local analysis
+  ! state (dim_l) and never written back to CLM.
+  real(r8), parameter :: spval_sif = 1.e36_r8      !< same as clm_varcon spval
+  integer :: clm_sif_obs_offset = 0                 !< index before the first SIF obs-equivalent entry
+  real(r8), allocatable :: sifescn_mean_g(:)        !< (begg:endg) gridcell-mean SIFESCN of this member at
+                                                    !< the analysis time, spval where none (used for QC)
+
   ! Within the SIF block (size = n_sif_vars*num_sif_g):
   !   positions             1 ..   num_sif_g = gridcell-average leafc [gC/m2]
   !   positions num_sif_g + 1 .. 2*num_sif_g = gridcell-average leafn [gN/m2]
@@ -140,7 +154,7 @@ module enkf_clm_mod
   !   https://doi.org/10.5281/zenodo.20059090 (updates leafc and leafn; SIF and
   !   LAI are only used for the observation operator and not written back).
   !===========================================================================
- 
+
 #endif
   integer(c_int),bind(C,name="clmprint_et")       :: clmprint_et
   integer(c_int),bind(C,name="clmprint_inc")       :: clmprint_inc
@@ -671,16 +685,18 @@ module enkf_clm_mod
   !>                     Call AFTER define_clm_statevec_tws.
   !>   otherwise       : all gridcells with at least one active vegetated patch
   !>                     (SIF-only DA, or SIF together with SWC).
-
+  !>
+  !> tlai is not part of the state: CLM5-BGC re-derives it from leafc every step.
+  !>
   subroutine define_clm_statevec_sif(mype)
- 
+
     use PatchType, only : patch
- 
+
     implicit none
     integer, intent(in) :: mype
     integer :: g, p, k
     logical, allocatable :: has_veg(:)
- 
+
     select case (clmupdate_sif)
     case(1)          ! DART/CLM5 (Huo, 2026): leafc + leafn
       n_sif_vars = 2
@@ -689,13 +705,13 @@ module enkf_clm_mod
     case default
       error stop "Unsupported clmupdate_sif (use 0, 1 or 2)"
     end select
- 
+
     ! ---- gridcell list of the SIF block
     if (allocated(sif_gridcells)) deallocate(sif_gridcells)
     if (allocated(sif_idx_of_g))  deallocate(sif_idx_of_g)
     allocate(sif_idx_of_g(clm_begg:clm_endg))
     sif_idx_of_g = 0
- 
+
     if (clmupdate_tws==1) then
       if (num_hactiveg == 0) error stop "define_clm_statevec_sif: call after define_clm_statevec_tws"
       num_sif_g = num_hactiveg
@@ -719,16 +735,21 @@ module enkf_clm_mod
       end do
       deallocate(has_veg)
     end if
- 
+
     do k = 1, num_sif_g
       sif_idx_of_g(sif_gridcells(k)) = k
     end do
- 
+
     ! Record offset BEFORE extending clm_statevecsize
     clm_sif_offset   = clm_statevecsize
-    clm_varsize_sif  = n_sif_vars * num_sif_g
-    clm_statevecsize = clm_statevecsize + clm_varsize_sif
- 
+    clm_sif_obs_offset = clm_sif_offset + n_sif_vars * num_sif_g
+    clm_varsize_sif    = (n_sif_vars + 1) * num_sif_g
+    clm_statevecsize   = clm_statevecsize + clm_varsize_sif
+
+    IF (allocated(sifescn_mean_g)) DEALLOCATE(sifescn_mean_g)
+    ALLOCATE(sifescn_mean_g(clm_begg:clm_endg))
+    sifescn_mean_g = spval_sif
+
     ! Allocate gridcell-level increment arrays (begg:endg, zeroed each cycle)
     IF (allocated(leafc_inc_g)) DEALLOCATE(leafc_inc_g)
     IF (allocated(leafn_inc_g)) DEALLOCATE(leafn_inc_g)
@@ -744,7 +765,6 @@ module enkf_clm_mod
       " clm_varsize_sif=", clm_varsize_sif, &
       " clm_sif_offset=", clm_sif_offset
 #endif
-
 
   end subroutine define_clm_statevec_sif
   !===========================================================================
@@ -765,8 +785,14 @@ module enkf_clm_mod
     !=========================================================================
     clm_varsize_sif = 0
     clm_sif_offset  = 0
+    n_sif_vars      = 0
+    clm_sif_obs_offset = 0
+    IF (allocated(sifescn_mean_g)) DEALLOCATE(sifescn_mean_g)
+    num_sif_g       = 0
+    IF (allocated(sif_gridcells)) DEALLOCATE(sif_gridcells)
+    IF (allocated(sif_idx_of_g))  DEALLOCATE(sif_idx_of_g)
     IF (allocated(leafc_inc_g)) DEALLOCATE(leafc_inc_g)
-    IF (allocated(leafn_inc_g))  DEALLOCATE(leafn_inc_g)
+    IF (allocated(leafn_inc_g)) DEALLOCATE(leafn_inc_g)
     !=========================================================================
 
   end subroutine cleanup_clm_statevec
@@ -1148,7 +1174,7 @@ module enkf_clm_mod
 
 
   !===========================================================================
-  ! Annika: new subroutine set_clm_statevec_sif
+  ! new subroutine set_clm_statevec_sif
   !===========================================================================
   !>  Fill the SIF state vector block with gridcell-average leafc and leafn
   !>
@@ -1160,24 +1186,24 @@ module enkf_clm_mod
   !> gridcell (non-vegetated patches contribute zero). One pass over the patches.
   !>
   subroutine set_clm_statevec_sif()
- 
-    use clm_instMod,  only : bgc_vegetation_inst
+
+    use clm_instMod,  only : bgc_vegetation_inst, photosyns_inst
     use PatchType,    only : patch
     use shr_kind_mod, only : r8 => shr_kind_r8
     use clm_varcon,   only : spval
- 
+
     implicit none
- 
+
     integer  :: count, g, p, cc_leafc, cc_leafn
     real(r8), allocatable :: lc_g(:), ln_g(:), wt_g(:)
     real(r8), pointer :: leafc(:), leafn(:)
- 
+
     leafc => bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch
     leafn => bgc_vegetation_inst%cnveg_nitrogenstate_inst%leafn_patch
- 
+
     allocate(lc_g(clm_begg:clm_endg), ln_g(clm_begg:clm_endg), wt_g(clm_begg:clm_endg))
     lc_g = 0.0_r8; ln_g = 0.0_r8; wt_g = 0.0_r8
- 
+
     do p = clm_begp, clm_endp
       g = patch%gridcell(p)
       if (sif_idx_of_g(g) > 0 .and. patch%active(p) .and. patch%wtgcell(p) > 0.0_r8) then
@@ -1186,7 +1212,7 @@ module enkf_clm_mod
         wt_g(g) = wt_g(g) + patch%wtgcell(p)
       end if
     end do
- 
+
     do count = 1, num_sif_g
       g        = sif_gridcells(count)
       cc_leafc = clm_sif_offset + count
@@ -1195,11 +1221,11 @@ module enkf_clm_mod
         lc_g(g) = lc_g(g) / wt_g(g)
         ln_g(g) = ln_g(g) / wt_g(g)
       end if
- 
+
       clm_statevec(cc_leafc)      = lc_g(g)
       clm_statevec_orig(cc_leafc) = lc_g(g)
       gridcell_state(cc_leafc)    = g     ! used by the localisation
- 
+
       select case (n_sif_vars)
       case(2)
         clm_statevec(cc_leafn)      = ln_g(g)
@@ -1207,11 +1233,33 @@ module enkf_clm_mod
         gridcell_state(cc_leafn)    = g
       end select
     end do
- 
-    deallocate(lc_g, ln_g, wt_g)
- 
-  end subroutine set_clm_statevec_sif
 
+    ! ---- SIF observation equivalent: instantaneous SIFESCN of the last time step,
+    !      gridcell mean over active patches (patches with spval/NaN are skipped;
+    !      non-vegetated patches have SIFESCN = 0 and count with their weight)
+    lc_g = 0.0_r8; wt_g = 0.0_r8
+    do p = clm_begp, clm_endp
+      g = patch%gridcell(p)
+      if (sif_idx_of_g(g) == 0) cycle
+      if (.not. patch%active(p) .or. patch%wtgcell(p) <= 0.0_r8) cycle
+      if (photosyns_inst%sifescn_patch(p) /= spval .and. &
+          photosyns_inst%sifescn_patch(p) == photosyns_inst%sifescn_patch(p)) then   ! not NaN
+        lc_g(g) = lc_g(g) + photosyns_inst%sifescn_patch(p) * patch%wtgcell(p)
+        wt_g(g) = wt_g(g) + patch%wtgcell(p)
+      end if
+    end do
+    sifescn_mean_g = spval_sif
+    do count = 1, num_sif_g
+      g = sif_gridcells(count)
+      if (wt_g(g) > 0.0_r8) sifescn_mean_g(g) = lc_g(g) / wt_g(g)
+      clm_statevec(clm_sif_obs_offset + count)      = merge(sifescn_mean_g(g), 0.0_r8, wt_g(g) > 0.0_r8)
+      clm_statevec_orig(clm_sif_obs_offset + count) = clm_statevec(clm_sif_obs_offset + count)
+      gridcell_state(clm_sif_obs_offset + count)    = g
+    end do
+
+    deallocate(lc_g, ln_g, wt_g)
+
+  end subroutine set_clm_statevec_sif
   !===========================================================================
 
 
@@ -1792,7 +1840,7 @@ module enkf_clm_mod
 
 
   !===========================================================================
-  ! Annika: new subroutine clm_update_sif
+  ! new subroutine clm_update_sif
   !===========================================================================
   !> Apply the SIF analysis to the CLM leaf carbon and nitrogen pools
   !>
@@ -1801,16 +1849,17 @@ module enkf_clm_mod
   !>   - keeps the distribution between PFTs,
   !>   - cannot create negative pools,
   !>   - patches without leaves (leafc = 0, e.g. before green-up or bare soil)
-  !>     stay at zero, i.e. DA does not let vegetation appear for nowhere (same as in DART/CLM5).
+  !>     stay at zero, i.e. DA does not let vegetation sprout (as in DART/CLM5).
   !> The factor is limited to 1 +- max_inc_sif, and the pools are clamped to
   !> [0, leafc_max_sif] and [0, leafn_max_sif].
   !>
-  !> case(1): leafc and leafn are both in the state vector and scaled with their own factors.
+  !> case(1): leafc and leafn are both in the state and scaled with their own factors.
   !> case(2): only leafc is in the state; leafn is scaled with the realised leafc
   !>          change, so the leaf C:N ratio of every patch stays unchanged.
   !>
+  !> tlai/elai are not touched; CLM5-BGC re-derives them from leafc.
   !> NOTE: switch off the CN balance check for the first step after the update
-  !> (CNBalanceCheckMod), otherwise the changed pools might trigger a balance error.
+  !> (CNBalanceCheckMod), otherwise the changed pools trigger a balance error.
   !>
   subroutine clm_update_sif()
     use clm_instMod,  only : bgc_vegetation_inst
@@ -1821,15 +1870,15 @@ module enkf_clm_mod
     real(r8) :: lc_before, ln_before
     real(r8), allocatable :: sc_c(:), sc_n(:), wt_g(:)
     real(r8), pointer :: leafc(:), leafn(:)
- 
+
     leafc => bgc_vegetation_inst%cnveg_carbonstate_inst%leafc_patch
     leafn => bgc_vegetation_inst%cnveg_nitrogenstate_inst%leafn_patch
- 
+
     allocate(sc_c(clm_begg:clm_endg), sc_n(clm_begg:clm_endg), wt_g(clm_begg:clm_endg))
     sc_c = 1.0_r8; sc_n = 1.0_r8; wt_g = 0.0_r8
     leafc_inc_g = 0.0_r8
     leafn_inc_g = 0.0_r8
- 
+
     ! ---- scaling factor per gridcell (posterior / prior of the gridcell average)
     do count = 1, num_sif_g
       g        = sif_gridcells(count)
@@ -1843,17 +1892,17 @@ module enkf_clm_mod
         sc_n(g) = sc_c(g)
       end select
     end do
- 
+
     ! ---- apply to the patches (one pass); store the realised gridcell increments
     do p = clm_begp, clm_endp
       g = patch%gridcell(p)
       if (sif_idx_of_g(g) == 0) cycle
       if (.not. patch%active(p) .or. patch%wtgcell(p) <= 0.0_r8) cycle
- 
+
       lc_before = leafc(p)
       ln_before = leafn(p)
       if (sc_c(g) /= 1.0_r8) leafc(p) = max(0.0_r8, min(leafc_max_sif, lc_before * sc_c(g)))
- 
+
       select case (obs_type_update_sif)
       case(1)
         if (sc_n(g) /= 1.0_r8) leafn(p) = max(0.0_r8, min(leafn_max_sif, ln_before * sc_n(g)))
@@ -1861,21 +1910,21 @@ module enkf_clm_mod
         ! keep the C:N of the patch: leafn follows the realised leafc change (incl. clamping)
         if (lc_before > 0.0_r8) leafn(p) = max(0.0_r8, min(leafn_max_sif, ln_before * leafc(p) / lc_before))
       end select
- 
+
       leafc_inc_g(g) = leafc_inc_g(g) + (leafc(p) - lc_before) * patch%wtgcell(p)
       leafn_inc_g(g) = leafn_inc_g(g) + (leafn(p) - ln_before) * patch%wtgcell(p)
       wt_g(g)        = wt_g(g) + patch%wtgcell(p)
     end do
- 
+
     where (wt_g > 0.0_r8)
       leafc_inc_g = leafc_inc_g / wt_g
       leafn_inc_g = leafn_inc_g / wt_g
     end where
- 
+
     deallocate(sc_c, sc_n, wt_g)
- 
+
   contains
- 
+
     real(r8) function sif_scale(old_val, new_val)
       real(r8), intent(in) :: old_val, new_val
       if (abs(new_val - old_val) > 1.0e-10_r8 .and. old_val > 1.0e-8_r8) then
@@ -1886,9 +1935,8 @@ module enkf_clm_mod
         sif_scale = 1.0_r8
       end if
     end function sif_scale
- 
-  end subroutine clm_update_sif
 
+  end subroutine clm_update_sif
   !===========================================================================
 
 
@@ -2172,6 +2220,12 @@ module enkf_clm_mod
 
     call get_proc_bounds(begg=begg, endg=endg, begc=begc, endc=endc)
 
+    ! SIF-only DA: one local domain per SIF gridcell
+    if (clmupdate_sif/=0 .and. clmupdate_tws/=1 .and. clmupdate_swc==0 .and. clmupdate_texture==0) then
+      n_domains_p = num_sif_g
+      return
+    end if
+
     if(clmupdate_swc==1) then
       if(clmstatevec_allcol==1) then
         n_domains_p = endc - begc + 1
@@ -2252,6 +2306,7 @@ module enkf_clm_mod
     integer :: g, i, count
 
     nshift = 0
+    dim_l  = 0
 
     if(clmupdate_swc==1) then
       if(clmstatevec_only_active == 1) then
@@ -2306,7 +2361,6 @@ module enkf_clm_mod
       end select
     endif
 
-
     !=========================================================================
     ! extend dim_l for SIF state variables (leafc, + leafn for clmupdate_sif=1)
     !
@@ -2327,7 +2381,6 @@ module enkf_clm_mod
     end if
     !=========================================================================
 
-
   end subroutine init_dim_l_clm
 
 
@@ -2346,10 +2399,10 @@ module enkf_clm_mod
     INTEGER :: i, sub, g, j
     !=========================================================================
     !  declare j_sif, g_sif, tws_dim_l for SIF extraction
-    ! tws_dim_l is the effective dim_l seen by the TWS code - it excludes
+    ! tws_dim_l is the effective dim_l seen by the TWS code — it excludes
     ! the 2 SIF slots appended at the end when clmupdate_sif=1.
     !=========================================================================
-    INTEGER :: j_sif, g_sif, tws_dim_l
+    INTEGER :: j_sif, tws_dim_l
     !=========================================================================
 
     ! Compute tws_dim_l: strip the SIF extension so TWS indexing is unchanged
@@ -2358,7 +2411,7 @@ module enkf_clm_mod
     else
       tws_dim_l = dim_l
     end if
- 
+
     NOGRACE: if (clmupdate_tws/=1) then
     if (clmupdate_swc/=0 .or. clmupdate_texture/=0) then
       DO i = 1, tws_dim_l
@@ -2366,13 +2419,13 @@ module enkf_clm_mod
       END DO
     end if
     else NOGRACE
- 
+
       if (clm_varsize_tws(5)/=0) then
         sub=3
       else
         sub=2
       end if
- 
+
       select case (state_setup)
       case(0)
         g = hactiveg_levels(domain_p,1)
@@ -2399,13 +2452,13 @@ module enkf_clm_mod
             end if
           end if
         end do
- 
+
       case(1)
         g = hactiveg_levels(domain_p,1)
         do j = 1, num_layer(1)
           if (g==hactiveg_levels(j,1)) state_l(1) = state_p(j)
         end do
- 
+
       case(2)
         g = hactiveg_levels(domain_p,1)
         do j = 1, num_layer(1)
@@ -2424,13 +2477,13 @@ module enkf_clm_mod
             if (g==hactiveg_levels(j,13)) state_l(3) = state_p(j + sum(clm_varsize_tws(1:2)))
           end do
         end if
- 
+
       case default
         error stop "Unsupported state_setup"
       end select
- 
+
     end if NOGRACE
- 
+
     !=========================================================================
     !  extract SIF leafc (tws_dim_l+1) and leafn (tws_dim_l+2, case 1) from state_p
     ! These slots are appended AFTER all TWS/SWC slots (indices tws_dim_l+1
@@ -2449,22 +2502,22 @@ module enkf_clm_mod
       end if
     end if
     !=========================================================================
- 
+
   end subroutine g2l_state_clm
- 
- 
+
+
   subroutine l2g_state_clm(domain_p, dim_l, state_l, dim_p, state_p)
- 
+
     use ColumnType , only : col
- 
+
     implicit none
- 
+
     INTEGER, INTENT(in)    :: domain_p
     INTEGER, INTENT(in)    :: dim_l
     INTEGER, INTENT(in)    :: dim_p
     REAL, TARGET, INTENT(in)    :: state_l(dim_l)
     REAL, TARGET, INTENT(inout) :: state_p(dim_p)
- 
+
     INTEGER :: i, sub, j, g
     !=========================================================================
     ! declare j_sif, g_sif, tws_dim_l for SIF write-back.
@@ -2476,14 +2529,14 @@ module enkf_clm_mod
     !=========================================================================
     INTEGER :: j_sif, tws_dim_l
     !=========================================================================
- 
+
     ! Compute tws_dim_l once for both NOGRACE paths and the TWS select case
     if (clmupdate_sif/=0) then
       tws_dim_l = dim_l - n_sif_vars
     else
       tws_dim_l = dim_l
     end if
- 
+
     ! -------------------------------------------------------------------------
     ! SWC / non-TWS path (NOGRACE = .TRUE. when clmupdate_tws==0)
     ! Uses tws_dim_l to avoid stomping on SIF slots at the end of state_l.
@@ -2495,7 +2548,7 @@ module enkf_clm_mod
       END DO
     end if
     else NOGRACE
- 
+
     ! -------------------------------------------------------------------------
     ! TWS path: all dim_l references inside the select case replaced by
     ! tws_dim_l so that the snow/surface-water tail slots are correct even
@@ -2506,7 +2559,7 @@ module enkf_clm_mod
       else
         sub=2
       end if
- 
+
       select case (state_setup)
       case(0)
         ! Soil layers: 1 .. tws_dim_l-sub
@@ -2535,14 +2588,14 @@ module enkf_clm_mod
             end if
           end if
         end do
- 
+
       case(1)
         ! Single TWS value at slot 1 — no tail slots, no conflict
         g = hactiveg_levels(domain_p,1)
         do j = 1, num_layer(1)
           if (g==hactiveg_levels(j,1)) state_p(j) = state_l(1)
         end do
- 
+
       case(2)
         ! Aggregated SM + snow: snow is at tws_dim_l (not dim_l)
         g = hactiveg_levels(domain_p,1)
@@ -2558,13 +2611,13 @@ module enkf_clm_mod
         do j = 1, num_layer(13)
           if (g==hactiveg_levels(j,13)) state_p(j + sum(clm_varsize_tws(1:2))) = state_l(3)
         end do
- 
+
       case default
         error stop "Unsupported state_setup"
       end select
- 
+
     endif NOGRACE
- 
+
     !=========================================================================
     ! write back BOTH SIF slots
     !   state_l(tws_dim_l+1) = leafc → state_p(clm_sif_offset + j_sif)
@@ -2582,26 +2635,39 @@ module enkf_clm_mod
       end if
     end if
     !=========================================================================
- 
+
   end subroutine l2g_state_clm
- 
- 
-  !> Position of the gridcell of local domain domain_p in the SIF block (0 = none)
-  integer function sif_index_of_domain(domain_p)
+
+
+  !> Gridcell index g of local analysis domain domain_p, for every state setup
+  integer function gridcell_of_domain(domain_p)
     use ColumnType, only : col
     implicit none
     integer, intent(in) :: domain_p
-    integer :: g
- 
+
     if (clmupdate_tws==1) then
-      g = hactiveg_levels(domain_p, 1)                 ! TWS domains = TWS gridcells
+      gridcell_of_domain = hactiveg_levels(domain_p, 1)              ! TWS domains = TWS gridcells
     else if (clmupdate_swc==0 .and. clmupdate_texture==0) then
+      gridcell_of_domain = sif_gridcells(domain_p)                    ! SIF-only domains
+    else if (clmstatevec_allcol==0 .and. clmstatevec_only_active==0) then
+      gridcell_of_domain = state_loc2clm_c_p(domain_p)                ! SWC: holds the gridcell index
+    else
+      gridcell_of_domain = col%gridcell(state_loc2clm_c_p(domain_p))  ! SWC: holds a column index
+    end if
+  end function gridcell_of_domain
+
+
+  !> Position of the gridcell of local domain domain_p in the SIF block (0 = none)
+  integer function sif_index_of_domain(domain_p)
+    implicit none
+    integer, intent(in) :: domain_p
+    integer :: g
+
+    if (clmupdate_tws/=1 .and. clmupdate_swc==0 .and. clmupdate_texture==0) then
       sif_index_of_domain = domain_p                    ! SIF-only: domains = SIF gridcells
       return
-    else
-      g = col%gridcell(state_loc2clm_c_p(domain_p))     ! SWC domains (column or gridcell)
     end if
- 
+    g = gridcell_of_domain(domain_p)
     if (g >= clm_begg .and. g <= clm_endg) then
       sif_index_of_domain = sif_idx_of_g(g)
     else
@@ -2609,5 +2675,5 @@ module enkf_clm_mod
     end if
   end function sif_index_of_domain
 #endif
- 
+
 end module enkf_clm_mod
