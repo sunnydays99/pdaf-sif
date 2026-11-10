@@ -97,7 +97,7 @@
     !IF (assim_C) CALL init_dim_obs_C(step, dim_obs_C)
 
     ! old dim_obs = dim_obs_GRACE + dim_obs_SM! + dim_obs_C
-    dim_obs = dim_obs_GRACE + dim_obs_SM! + dim_obs_SIF
+    dim_obs = dim_obs_GRACE + dim_obs_SM + dim_obs_SIF
 
   END SUBROUTINE init_dim_obs_pdafomi
 
