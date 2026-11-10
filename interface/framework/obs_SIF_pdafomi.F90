@@ -11,7 +11,7 @@ MODULE obs_SIF_pdafomi
 
     PUBLIC
 
-    ! Variables which are inputs to the module 
+    ! Variables which are inputs to the module (usually set in init_pdaf)
     LOGICAL :: assim_SIF       !< Whether to assimilate this data type
     REAL    :: rms_obs_SIF     !< Observation error standard deviation (for constant errors)
 
@@ -174,8 +174,8 @@ CONTAINS
 
       ! -----------------------------------------------------------------------
       ! QC fields:
-      !  - sifescn_mean_g (enkf_clm_mod): window-mean SIF of this model task,
-      !    spval/<=0 where there was no valid daytime sample or no vegetation
+      !  - sifescn_mean_g (enkf_clm_mod): SIFESCN of this model task at the
+      !    analysis time, spval/<=0 at night or without vegetation
       !  - fsno_current: gridcell snow fraction
       ! -----------------------------------------------------------------------
       obs_begg = begg
@@ -359,8 +359,8 @@ CONTAINS
         sif_obs_valid = .FALSE.
         IF (sif_idx_of_g(g) == 0)               RETURN   ! gridcell not in SIF state block
         IF (fsno_current(g-begg+1) > 0.5)       RETURN   ! snow-covered
-        IF (sifescn_mean_g(g) >= 1.e30_r8)      RETURN   ! no daytime model SIF in the window
-        IF (sifescn_mean_g(g) <= 0.0_r8)        RETURN   ! no vegetation / no SIF
+        IF (sifescn_mean_g(g) >= 1.e30_r8)      RETURN   ! no model SIF
+        IF (sifescn_mean_g(g) <= 0.0_r8)        RETURN   ! night / no vegetation
         IF (obsval < -1.e10)                    RETURN   ! fill value of the obs file
         sif_obs_valid = .TRUE.
       END FUNCTION sif_obs_valid
@@ -372,8 +372,9 @@ CONTAINS
     !> @brief SIF observation operator
     !!
     !! Takes the model SIF of the CURRENT ensemble member from the state vector
-    !! (SIF obs-equivalent block of enkf_clm_mod: window-mean SIFESCN per SIF
-    !! gridcell). obs_index_p(i) holds the local gridcell offset g-begg+1.
+    !! (SIF obs-equivalent block of enkf_clm_mod: gridcell-mean SIFESCN of the
+    !! last time step before the analysis). obs_index_p(i) holds the local
+    !! gridcell offset g-begg+1.
     !!
     SUBROUTINE obs_op_SIF(dim_p, dim_obs, state_p, ostate)
 
@@ -699,8 +700,12 @@ CONTAINS
     !! Model SIF used for the comparison: SIFESCN (sifescn_patch), the SIF
     !! escaping the canopy in nadir direction, i.e. what TROPOMI/GOME-2 see,
     !! rather than the total emitted FSIF. It enters the state vector as the
-    !! mean over the DA window at satellite overpass time (enkf_clm_mod and the
-    !! accumulation in PhotosynthesisMod).
+    !! instantaneous value of the last model time step before the analysis
+    !! (enkf_clm_mod, set_clm_statevec_sif), so the DA time should be set close
+    !! to the satellite overpass. NOTE units: sifescn_patch is a flux
+    !! (W m-2 um-1, no sr); satellite SIF is a radiance (mW m-2 sr-1 nm-1 =
+    !! W m-2 sr-1 um-1) -> divide the model value by pi (Lambertian) or
+    !! multiply the observations by pi before assimilation.
     !!
     !! read_fsno_for_qc: column-average frac_sno_col over hydrologically active
     !! columns, indexed (1 : endg-begg+1). One pass over the columns.
