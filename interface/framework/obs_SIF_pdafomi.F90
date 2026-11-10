@@ -40,11 +40,11 @@ CONTAINS
 
     !> @brief Initialize information on the SIF observation type
     !!
-    !! Reads gridded satellite SIF observations and eCLM simulated FSIF,
+    !! Reads gridded satellite SIF observations and eCLM simulated SIF (here we would need SIFESCN, so like the SIF that escapes for the canopy which is the SIF the satellite would see. Its at 740nm)
     !! applies physical QC masks (night, snow, no-vegetation), and builds
     !! the PE-local observation arrays for PDAF-OMI.
     !!
-    !! Mirrors init_dim_obs_SM exactly at the gridcell level (not column).
+    !! mirrors init_dim_obs_SM exactly at the gridcell level (not column).
     !!
     SUBROUTINE init_dim_obs_SIF(step, dim_obs)
 
@@ -696,7 +696,7 @@ CONTAINS
     !!   - sifescn_patch = SIF actually escaping the canopy in the NADIR
     !!     direction (W/m2/um), computed by fluorescence_upscaling() from
     !!     FSIF using the canopy reflectance and escape fraction.
-    !!   TROPOMI measures nadir-viewing radiance, so sifescn_patch is the
+    !!   TROPOMI/GOME-2/ect measures nadir-viewing radiance, so sifescn_patch is the
     !!   physically correct quantity to compare against TROPOMI observations.
     !!   Using fsif_patch would systematically overestimate the forward operator
     !!   (total emission vs. what escapes toward the satellite).
@@ -727,8 +727,7 @@ CONTAINS
           ! --- SIFESCN: patch-area-weighted average of nadir-escaping SIF ---
           !
           ! sifescn_patch is produced by fluorescence_upscaling() in
-          ! PhotosynthesisTotal. It accounts for the canopy escape fraction
-          ! and is in the same W/m2/um units as the TROPOMI retrieval.
+          ! PhotosynthesisTotal. 
           ! It is 0.0 at night (set via TimeStepInit → fsif_patch=0 →
           ! fluorescence_upscaling propagates 0 → sifescn_patch=0).
           fsif_sum = 0.0_r8
