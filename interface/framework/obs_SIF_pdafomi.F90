@@ -11,7 +11,7 @@ MODULE obs_SIF_pdafomi
 
     PUBLIC
 
-    ! Variables which are inputs to the module (usually set in init_pdaf)
+    ! Variables which are inputs to the module 
     LOGICAL :: assim_SIF       !< Whether to assimilate this data type
     REAL    :: rms_obs_SIF     !< Observation error standard deviation (for constant errors)
 
@@ -19,14 +19,13 @@ MODULE obs_SIF_pdafomi
     INTEGER, ALLOCATABLE :: longxy(:), latixy(:), longxy_obs(:), latixy_obs(:)
 
     ! -----------------------------------------------------------------------
-    ! Module-level SAVE arrays for SIF forward operator.
-    !
-    ! Filled once per analysis step in init_dim_obs_SIF via
-    ! read_fsif_from_history(), then consumed in obs_op_SIF.
-    ! Indexed as (1 : endg-begg+1), i.e. local gridcell offset.
+    ! QC array, filled in init_dim_obs_SIF, indexed (1 : endg-begg+1).
+    ! The model SIF itself is NOT stored here: the observation operator takes
+    ! it from the state vector (SIF obs-equivalent block of enkf_clm_mod), so
+    ! that every ensemble member uses its own SIF.
     ! -----------------------------------------------------------------------
-    REAL, ALLOCATABLE, SAVE :: sifescn_current(:)  !< gridcell-avg nadir-escaping SIF [W/m2/um] (from sifescn_patch)
     REAL, ALLOCATABLE, SAVE :: fsno_current(:)    !< gridcell snow fraction [-]
+    INTEGER, SAVE :: obs_begg = 0                 !< begg at the time of init_dim_obs_SIF
 
     ! Declare instances of observation data types used here
     TYPE(obs_f), TARGET, PUBLIC :: thisobs      ! full observation
@@ -61,7 +60,8 @@ CONTAINS
       USE mod_read_obs, ONLY: multierr, read_obs_nc_type
       USE enkf_clm_mod, ONLY: clmstatevec_allcol, clmstatevec_only_active, &
                                clmstatevec_max_layer, state_clm2pdaf_p, &
-                               domain_def_clm
+                               domain_def_clm, clmupdate_sif, &
+                               sif_idx_of_g, sifescn_mean_g
       USE shr_kind_mod, ONLY: r8 => shr_kind_r8
       USE GridcellType, ONLY: grc
       USE clm_varcon,   ONLY: spval, ispval
@@ -96,13 +96,20 @@ CONTAINS
       INTEGER :: begp, endp, begc, endc, begl, endl, begg, endg
       INTEGER :: numg, numl, numc, nump
       INTEGER :: sum_dim_obs_p, ierror
+      INTEGER :: dim_obs_nc               ! number of obs in the file (before QC)
       REAL(r8), POINTER :: lon(:), lat(:)
       REAL :: deltax, deltay
       LOGICAL :: obs_snapped
       LOGICAL :: is_use_dr        ! always .TRUE. for SIF (deltax/deltay snapping)
 
       IF (mype_filter==0) &
-          WRITE(*,*) 'Assimilate observations - obs type SIF (FSIF at 740 nm)'
+          WRITE(*,*) 'Assimilate observations - obs type SIF (SIFESCN at 740 nm)'
+
+      ! The model SIF comes from the SIF block of the state vector
+      IF (clmupdate_sif == 0) THEN
+          WRITE(*,*) "TSMP-PDAF: ERROR SIF observations need clmupdate_sif = 1 or 2"
+          CALL abort_parallel()
+      END IF
 
       IF (assim_SIF) thisobs%doassim = 1
       thisobs%disttype = 3   ! geographic haversine
@@ -120,6 +127,7 @@ CONTAINS
       END IF
 
       CALL mpi_bcast(dim_obs, 1, MPI_INTEGER, 0, comm_filter, ierror)
+      dim_obs_nc = dim_obs
 
       ! Handle zero-obs case, same as obs_SM_pdafomi
       IF (dim_obs == 0) THEN
@@ -165,16 +173,15 @@ CONTAINS
       CALL get_proc_global(numg, numl, numc, nump)
 
       ! -----------------------------------------------------------------------
-      ! Allocate and fill module-level QC arrays from the live CLM instance.
-      ! read_fsif_from_history fills sifescn_current and fsno_current
-      ! indexed (1:endg-begg+1). Defined at the bottom of this module.
+      ! QC fields:
+      !  - sifescn_mean_g (enkf_clm_mod): window-mean SIF of this model task,
+      !    spval/<=0 where there was no valid daytime sample or no vegetation
+      !  - fsno_current: gridcell snow fraction
       ! -----------------------------------------------------------------------
-      IF (ALLOCATED(sifescn_current))   DEALLOCATE(sifescn_current)
-      IF (ALLOCATED(fsno_current))   DEALLOCATE(fsno_current)
-      ALLOCATE(sifescn_current  (endg-begg+1))
-      ALLOCATE(fsno_current  (endg-begg+1))
-
-      CALL read_fsif_from_history(begg, endg, begp, endp, begc, endc)
+      obs_begg = begg
+      IF (ALLOCATED(fsno_current)) DEALLOCATE(fsno_current)
+      ALLOCATE(fsno_current(endg-begg+1))
+      CALL read_fsno_for_qc(begg, endg, begc, endc)
 
       ! -----------------------------------------------------------------------
       ! First pass: count PE-local valid observations (dim_obs_p)
@@ -187,7 +194,7 @@ CONTAINS
       dim_obs_p = 0
       cnt       = 1
 
-      DO i = 1, dim_obs
+      DO i = 1, dim_obs_nc
           obs_snapped = .FALSE.
           DO g = begg, endg
 
@@ -196,10 +203,7 @@ CONTAINS
               deltay = ABS(lat(g) - lat_obs(i))
 
               IF ((deltax <= dr_obs(1)) .AND. (deltay <= dr_obs(2))) THEN
-                  IF (fsno_current  (g-begg+1) > 0.5)  CYCLE   ! snow-covered
-                  IF (sifescn_current  (g-begg+1) <= 0.0 .OR. &
-                      sifescn_current  (g-begg+1) == spval) CYCLE  ! no vegetation
-                  IF (obs_g(i) <= 0.0) CYCLE                    ! bad satellite obs
+                  IF (.NOT. sif_obs_valid(g, obs_g(i))) CYCLE   ! QC (snow, no vegetation, no model SIF)
 
                   dim_obs_p = dim_obs_p + 1
                   thisobs%id_obs_p(1, g-begg+1) = 1
@@ -224,12 +228,16 @@ CONTAINS
       CALL mpi_allreduce(dim_obs_p, sum_dim_obs_p, 1, MPI_INTEGER, MPI_SUM, &
                          comm_filter, ierror)
 
-      IF (sum_dim_obs_p /= dim_obs) THEN
+      ! Observations rejected by QC (snow, no vegetation, no daytime model SIF,
+      ! outside the domain) are dropped; dim_obs is reset by PDAFomi_gather_obs.
+      IF (sum_dim_obs_p > dim_obs_nc) THEN
           WRITE(*,*) "TSMP-PDAF mype(w)=", mype_world, &
-              ": ERROR SIF: sum of PE-local obs dims does not match dim_obs"
-          WRITE(*,*) "sum_dim_obs_p=", sum_dim_obs_p, "dim_obs=", dim_obs
+              ": ERROR SIF: more PE-local obs than obs in file (double snapping?)"
+          WRITE(*,*) "sum_dim_obs_p=", sum_dim_obs_p, "dim_obs_nc=", dim_obs_nc
           CALL abort_parallel()
       END IF
+      IF (mype_filter==0) WRITE(*,'(a,i8,a,i8)') " SIF: obs after QC ", sum_dim_obs_p, &
+                                                 " of ", dim_obs_nc
 
       IF (ALLOCATED(local_dims_obs)) DEALLOCATE(local_dims_obs)
       ALLOCATE(local_dims_obs(npes_filter))
@@ -251,16 +259,16 @@ CONTAINS
       ! obs_pdaf2nc / obs_nc2pdaf mapping,only gridcell level, no column loop
       ! -----------------------------------------------------------------------
       IF (ALLOCATED(obs_pdaf2nc)) DEALLOCATE(obs_pdaf2nc)
-      ALLOCATE(obs_pdaf2nc(dim_obs))
+      ALLOCATE(obs_pdaf2nc(dim_obs_nc))
       obs_pdaf2nc = 0
       IF (ALLOCATED(obs_nc2pdaf)) DEALLOCATE(obs_nc2pdaf)
-      ALLOCATE(obs_nc2pdaf(dim_obs))
+      ALLOCATE(obs_nc2pdaf(dim_obs_nc))
       obs_nc2pdaf = 0
 
       IF (point_obs == 1) THEN
 
           cnt = 1
-          DO i = 1, dim_obs
+          DO i = 1, dim_obs_nc
               obs_snapped = .FALSE.
 
               DO g = begg, endg
@@ -269,15 +277,9 @@ CONTAINS
                   deltay = ABS(lat(g) - lat_obs(i))
 
                   IF ((deltax <= dr_obs(1)) .AND. (deltay <= dr_obs(2))) THEN
-                      IF (fsno_current  (g-begg+1) > 0.5)    CYCLE
-                      IF (sifescn_current  (g-begg+1) <= 0.0 .OR. &
-                          sifescn_current  (g-begg+1) == spval) CYCLE
-                      IF (obs_g(i) <= 0.0)                   CYCLE
+                      IF (.NOT. sif_obs_valid(g, obs_g(i))) CYCLE
 
-                      ! No ispval/state_clm2pdaf_p check needed for SIF:
-                      ! non-vegetated gridcells are already masked by sifescn_current<=0.
-                      ! Note: obs over ocean will have obs_pdaf2nc=0 on all PEs
-                      ! this should produces a zero innovation, not a crash.
+                      ! Obs rejected by QC (or over ocean) keep obs_pdaf2nc = 0.
 
                       obs_pdaf2nc(local_disp_obs(mype_filter+1) + cnt) = i
                       obs_nc2pdaf(i) = local_disp_obs(mype_filter+1) + cnt
@@ -294,9 +296,9 @@ CONTAINS
 
       END IF
 
-      CALL mpi_allreduce(MPI_IN_PLACE, obs_pdaf2nc, dim_obs, MPI_INTEGER, &
+      CALL mpi_allreduce(MPI_IN_PLACE, obs_pdaf2nc, dim_obs_nc, MPI_INTEGER, &
                          MPI_SUM, comm_filter, ierror)
-      CALL mpi_allreduce(MPI_IN_PLACE, obs_nc2pdaf, dim_obs, MPI_INTEGER, &
+      CALL mpi_allreduce(MPI_IN_PLACE, obs_nc2pdaf, dim_obs_nc, MPI_INTEGER, &
                          MPI_SUM, comm_filter, ierror)
 
       IF (mype_filter==0 .AND. screen > 2) &
@@ -313,17 +315,14 @@ CONTAINS
       ALLOCATE(obs_index_p(dim_obs_p))
 
       cnt = 1
-      DO i = 1, dim_obs
+      DO i = 1, dim_obs_nc
           DO g = begg, endg
               deltax = ABS(lon(g) - lon_obs(i))
               IF (deltax > 180.0) deltax = 360.0 - deltax
               deltay = ABS(lat(g) - lat_obs(i))
 
               IF ((deltax <= dr_obs(1)) .AND. (deltay <= dr_obs(2))) THEN
-                  IF (fsno_current  (g-begg+1) > 0.5)    CYCLE
-                  IF (sifescn_current  (g-begg+1) <= 0.0 .OR. &
-                      sifescn_current  (g-begg+1) == spval) CYCLE
-                  IF (obs_g(i) <= 0.0)                   CYCLE
+                  IF (.NOT. sif_obs_valid(g, obs_g(i))) CYCLE
 
                   ocoord_p(1, cnt) = lon_obs(i) * pi / 180.0  ! haversine: radians
                   ocoord_p(2, cnt) = lat_obs(i) * pi / 180.0
@@ -351,20 +350,36 @@ CONTAINS
       IF (ALLOCATED(obserr))    DEALLOCATE(obserr)
       IF (ALLOCATED(obscov))    DEALLOCATE(obscov)
 
+    CONTAINS
+
+      !> QC for observation value obsval at gridcell g
+      LOGICAL FUNCTION sif_obs_valid(g, obsval)
+        INTEGER, INTENT(in) :: g
+        REAL,    INTENT(in) :: obsval
+        sif_obs_valid = .FALSE.
+        IF (sif_idx_of_g(g) == 0)               RETURN   ! gridcell not in SIF state block
+        IF (fsno_current(g-begg+1) > 0.5)       RETURN   ! snow-covered
+        IF (sifescn_mean_g(g) >= 1.e30_r8)      RETURN   ! no daytime model SIF in the window
+        IF (sifescn_mean_g(g) <= 0.0_r8)        RETURN   ! no vegetation / no SIF
+        IF (obsval < -1.e10)                    RETURN   ! fill value of the obs file
+        sif_obs_valid = .TRUE.
+      END FUNCTION sif_obs_valid
+
     END SUBROUTINE init_dim_obs_SIF
 
 
     !---------------------------------------------------------------------------
     !> @brief SIF observation operator
     !!
-    !! Direct lookup into sifescn_current. obs_index_p(i) holds the gridcell
-    !! offset set in init_dim_obs_SIF. No state_p indexing FSIF is a CLM
-    !! diagnostic, not a prognostic state variable.
+    !! Takes the model SIF of the CURRENT ensemble member from the state vector
+    !! (SIF obs-equivalent block of enkf_clm_mod: window-mean SIFESCN per SIF
+    !! gridcell). obs_index_p(i) holds the local gridcell offset g-begg+1.
     !!
     SUBROUTINE obs_op_SIF(dim_p, dim_obs, state_p, ostate)
 
       USE mod_assimilation,  ONLY: obs_index_p
       USE PDAFomi_obs_f,     ONLY: PDAFomi_gather_obsstate
+      USE enkf_clm_mod,      ONLY: clm_sif_obs_offset, sif_idx_of_g
 
       IMPLICIT NONE
 
@@ -373,7 +388,7 @@ CONTAINS
       REAL,    INTENT(inout) :: ostate(dim_obs)
 
       REAL, ALLOCATABLE :: ostate_p(:)
-      INTEGER :: i
+      INTEGER :: i, g
 
       IF (thisobs%dim_obs_p > 0) THEN
           ALLOCATE(ostate_p(thisobs%dim_obs_p))
@@ -382,7 +397,8 @@ CONTAINS
       END IF
 
       DO i = 1, thisobs%dim_obs_p
-          ostate_p(i) = sifescn_current(obs_index_p(i))
+          g = obs_begg + obs_index_p(i) - 1
+          ostate_p(i) = state_p(clm_sif_obs_offset + sif_idx_of_g(g))
       END DO
 
       CALL PDAFomi_gather_obsstate(thisobs, ostate_p, ostate)
@@ -401,8 +417,7 @@ CONTAINS
       USE PDAFomi, ONLY: PDAFomi_init_dim_obs_l, pi
       USE mod_assimilation, &
           ONLY: cradius_SIF, locweight, sradius_SIF, screen
-      USE enkf_clm_mod, ONLY: state_loc2clm_c_p, clmstatevec_allcol, &
-                               clmstatevec_only_active
+      USE enkf_clm_mod, ONLY: gridcell_of_domain
       USE shr_kind_mod, ONLY: r8 => shr_kind_r8
       USE decompMod,    ONLY: get_proc_bounds
       USE GridcellType, ONLY: grc
@@ -419,28 +434,20 @@ CONTAINS
 
       REAL :: coords_l(2)
       REAL(r8), POINTER :: lon(:), lat(:)
-      INTEGER, POINTER :: mycgridcell(:)
+      INTEGER :: g
 
-      lon         => grc%londeg
-      lat         => grc%latdeg
-      mycgridcell => col%gridcell
+      lon => grc%londeg
+      lat => grc%latdeg
 
       IF (thisobs%infile == 1) THEN
-          IF (clmstatevec_allcol==0 .AND. clmstatevec_only_active==0) THEN
-              IF (lon(state_loc2clm_c_p(domain_p)) > 180.0) THEN
-                  coords_l(1) = lon(state_loc2clm_c_p(domain_p)) - 360.0
-              ELSE
-                  coords_l(1) = lon(state_loc2clm_c_p(domain_p))
-              END IF
-              coords_l(2) = lat(state_loc2clm_c_p(domain_p))
+          ! gridcell of the local domain for TWS, SIF-only and SWC setups
+          g = gridcell_of_domain(domain_p)
+          IF (lon(g) > 180.0) THEN
+              coords_l(1) = lon(g) - 360.0
           ELSE
-              IF (lon(mycgridcell(state_loc2clm_c_p(domain_p))) > 180.0) THEN
-                  coords_l(1) = lon(mycgridcell(state_loc2clm_c_p(domain_p))) - 360.0
-              ELSE
-                  coords_l(1) = lon(mycgridcell(state_loc2clm_c_p(domain_p)))
-              END IF
-              coords_l(2) = lat(mycgridcell(state_loc2clm_c_p(domain_p)))
+              coords_l(1) = lon(g)
           END IF
+          coords_l(2) = lat(g)
 
           IF (thisobs%disttype == 3) THEN
               coords_l(1) = coords_l(1) * pi / 180.0
@@ -683,87 +690,54 @@ CONTAINS
       IF (ALLOCATED(thisobs_l%sradius))    DEALLOCATE(thisobs_l%sradius)
       IF (ALLOCATED(obs_l_all))            DEALLOCATE(obs_l_all)
 
-      IF (ALLOCATED(sifescn_current))   DEALLOCATE(sifescn_current)
       IF (ALLOCATED(fsno_current))   DEALLOCATE(fsno_current)
 
       firstobs = 0
 
     END SUBROUTINE deallocate_obs_SIF
 
-    !! FORWARD OPERATOR TARGET: sifescn_patch (SIFESCN, W/m2/um)
-    !!   - fsif_patch = total emitted SIF at canopy level, integrated over all
-    !!     directions. This is what Photosynthesis.F90 calls FSIF.
-    !!   - sifescn_patch = SIF actually escaping the canopy in the NADIR
-    !!     direction (W/m2/um), computed by fluorescence_upscaling() from
-    !!     FSIF using the canopy reflectance and escape fraction.
-    !!   TROPOMI/GOME-2/ect measures nadir-viewing radiance, so sifescn_patch is the
-    !!   physically correct quantity to compare against TROPOMI observations.
-    !!   Using fsif_patch would systematically overestimate the forward operator
-    !!   (total emission vs. what escapes toward the satellite).
+    !! Model SIF used for the comparison: SIFESCN (sifescn_patch), the SIF
+    !! escaping the canopy in nadir direction, i.e. what TROPOMI/GOME-2 see,
+    !! rather than the total emitted FSIF. It enters the state vector as the
+    !! mean over the DA window at satellite overpass time (enkf_clm_mod and the
+    !! accumulation in PhotosynthesisMod).
     !!
-    !! FSNO: column-average frac_sno_col over hydrologically active columns.
+    !! read_fsno_for_qc: column-average frac_sno_col over hydrologically active
+    !! columns, indexed (1 : endg-begg+1). One pass over the columns.
     !!
-    !! All arrays indexed (1 : endg-begg+1) = local gridcell offset.
-    !! Must be called AFTER ALLOCATE in init_dim_obs_SIF.
-    !!
-    SUBROUTINE read_fsif_from_history(begg, endg, begp, endp, begc, endc)
+    SUBROUTINE read_fsno_for_qc(begg, endg, begc, endc)
 
       USE shr_kind_mod, ONLY: r8 => shr_kind_r8
-      USE PatchType,    ONLY: patch
       USE ColumnType,   ONLY: col
-      USE clm_varcon,   ONLY: spval
-      USE clm_instMod,  ONLY: photosyns_inst, waterstate_inst
+      USE clm_instMod,  ONLY: waterstate_inst
 
       IMPLICIT NONE
 
-      INTEGER, INTENT(in) :: begg, endg, begp, endp, begc, endc
+      INTEGER, INTENT(in) :: begg, endg, begc, endc
+      INTEGER  :: g, c
+      REAL(r8), ALLOCATABLE :: fsno_sum(:)
+      INTEGER,  ALLOCATABLE :: n_col(:)
 
-      INTEGER  :: g, p, c
-      REAL(r8) :: wt_sum, fsif_sum, fsno_sum
-      INTEGER  :: n_col_active
-
+      ALLOCATE(fsno_sum(begg:endg), n_col(begg:endg))
+      fsno_sum = 0.0_r8
+      n_col    = 0
+      DO c = begc, endc
+          IF (col%hydrologically_active(c)) THEN
+              g = col%gridcell(c)
+              fsno_sum(g) = fsno_sum(g) + waterstate_inst%frac_sno_col(c)
+              n_col(g)    = n_col(g) + 1
+          END IF
+      END DO
       DO g = begg, endg
-
-          ! --- SIFESCN: patch-area-weighted average of nadir-escaping SIF ---
-          !
-          ! sifescn_patch is produced by fluorescence_upscaling() in
-          ! PhotosynthesisTotal. 
-          ! It is 0.0 at night (set via TimeStepInit → fsif_patch=0 →
-          ! fluorescence_upscaling propagates 0 → sifescn_patch=0).
-          fsif_sum = 0.0_r8
-          wt_sum   = 0.0_r8
-          DO p = begp, endp
-              IF (patch%gridcell(p) == g .AND. &
-                  patch%wtgcell(p)   > 0.0_r8 .AND. &
-                  photosyns_inst%sifescn_patch(p) /= spval .AND. &
-                  photosyns_inst%sifescn_patch(p)  > 0.0_r8) THEN
-                  fsif_sum = fsif_sum + photosyns_inst%sifescn_patch(p) * patch%wtgcell(p)
-                  wt_sum   = wt_sum   + patch%wtgcell(p)
-              END IF
-          END DO
-          sifescn_current(g-begg+1) = MERGE(REAL(fsif_sum/wt_sum), 0.0, wt_sum > 0.0_r8)
-
-          ! sifescn_patch=0 at night (TimeStepInit),
-          ! so sifescn_current > 0 already filters nighttime and bare-soil.
-
-          ! --- FSNO: column-average snow fraction ---
-          fsno_sum     = 0.0_r8
-          n_col_active = 0
-          DO c = begc, endc
-              IF (col%gridcell(c) == g .AND. col%hydrologically_active(c)) THEN
-                  fsno_sum     = fsno_sum + waterstate_inst%frac_sno_col(c)
-                  n_col_active = n_col_active + 1
-              END IF
-          END DO
-          IF (n_col_active > 0) THEN
-              fsno_current(g-begg+1) = REAL(fsno_sum / REAL(n_col_active, r8))
+          IF (n_col(g) > 0) THEN
+              fsno_current(g-begg+1) = REAL(fsno_sum(g) / REAL(n_col(g), r8))
           ELSE
               fsno_current(g-begg+1) = 0.0
           END IF
-
       END DO
+      DEALLOCATE(fsno_sum, n_col)
 
-    END SUBROUTINE read_fsif_from_history
+    END SUBROUTINE read_fsno_for_qc
 
 END MODULE obs_SIF_pdafomi
 #endif
