@@ -978,9 +978,7 @@ contains
             clmupdate_sif     = 0
 
         case ('SIF')
-            ! SIF assimilation: update leafc + tlai via enkf_clm_mod.
-            ! clmupdate_sif=1 enables the state update; set to 0 for obs-only mode.
-            ! clmupdate_tws must be 0 so GRACE TWS averaging is not triggered.
+            ! SIF assimilation: update leafc +leafn + tlai via enkf_clm_mod.
             clmupdate_tws     = 0
             clmupdate_swc     = 0
             clmupdate_T       = 0
